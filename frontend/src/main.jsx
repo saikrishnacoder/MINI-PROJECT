@@ -7,12 +7,17 @@ import { AuthProvider, useAuth } from "./auth";
 import Login from "./pages/Login";
 import Projects from "./pages/Projects";
 import ProjectDetail from "./pages/ProjectDetail";
+import ForgotPassword from "./pages/ForgotPassword";
+import ResetPassword from "./pages/ResetPassword";
+import Admin from "./pages/Admin";
 
 const queryClient = new QueryClient();
 
-function Protected({ children }) {
-  const { token } = useAuth();
-  return token ? children : <Navigate to="/login" replace />;
+function Protected({ children, adminOnly = false }) {
+  const { token, isAdmin } = useAuth();
+  if (!token) return <Navigate to="/login" replace />;
+  if (adminOnly && !isAdmin) return <Navigate to="/" replace />;
+  return children;
 }
 
 function App() {
@@ -21,8 +26,11 @@ function App() {
       <AuthProvider>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/forgot-password" element={<ForgotPassword />} />
+          <Route path="/reset-password" element={<ResetPassword />} />
           <Route path="/" element={<Protected><Projects /></Protected>} />
           <Route path="/projects/:id" element={<Protected><ProjectDetail /></Protected>} />
+          <Route path="/admin" element={<Protected adminOnly><Admin /></Protected>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AuthProvider>

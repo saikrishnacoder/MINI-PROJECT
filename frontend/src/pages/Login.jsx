@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth";
 
 export default function Login() {
@@ -58,6 +58,11 @@ export default function Login() {
           className="w-full text-sm text-slate-400 hover:text-slate-200">
           {mode === "login" ? "No account? Register" : "Have an account? Sign in"}
         </button>
+        {mode === "login" && (
+          <Link to="/forgot-password" className="block text-center text-sm text-indigo-300 hover:text-indigo-200">
+            Forgot password?
+          </Link>
+        )}
       </form>
     </div>
   );

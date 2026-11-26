@@ -10,7 +10,7 @@ const STATUS_STYLES = {
 };
 
 export default function Projects() {
-  const { api, token, logout } = useAuth();
+  const { api, token, logout, isAdmin } = useAuth();
   const qc = useQueryClient();
   const [name, setName] = useState("");
 
@@ -35,9 +35,16 @@ export default function Projects() {
         <h1 className="text-xl font-bold">
           Spec<span className="text-indigo-400">Forge</span> AI
         </h1>
-        <button onClick={logout} className="text-sm text-slate-400 hover:text-slate-200">
-          Sign out
-        </button>
+        <div className="flex items-center gap-4">
+          {isAdmin && (
+            <Link to="/admin" className="font-mono text-xs text-emerald-300 hover:text-emerald-200 uppercase tracking-wider">
+              Admin
+            </Link>
+          )}
+          <button onClick={logout} className="text-sm text-slate-400 hover:text-slate-200">
+            Sign out
+          </button>
+        </div>
       </header>
 
       <form
