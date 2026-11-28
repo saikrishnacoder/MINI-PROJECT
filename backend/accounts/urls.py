@@ -20,6 +20,21 @@ urlpatterns = [
         views.PasswordResetConfirmView.as_view(),
         name="password_reset_confirm",
     ),
+    path(
+        "auth/password-change/",
+        views.PasswordChangeView.as_view(),
+        name="password_change",
+    ),
+    path(
+        "auth/email/verify/",
+        views.EmailVerificationConfirmView.as_view(),
+        name="email_verify",
+    ),
+    path(
+        "auth/email/verify/request/",
+        views.EmailVerificationRequestView.as_view(),
+        name="email_verify_request",
+    ),
     path("auth/me/", views.MeView.as_view(), name="me"),
     path("", include(router.urls)),
 ]

@@ -20,6 +20,8 @@ class GeneratedBackend(models.Model):
     artifacts = models.JSONField(default=dict)
     tests_passed = models.BooleanField(null=True, blank=True)
     test_output = models.TextField(blank=True)
+    # Databases the generated suite was actually executed on, e.g. ["sqlite", "mysql"].
+    databases_tested = models.JSONField(default=list, blank=True)
     generated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
         related_name="generated_backends",

@@ -1,15 +1,25 @@
 """Phase 4 - Backend Development Engine.
 
 Turns an approved project's approved functional requirements into a real,
-runnable DRF app (models, serializers, permissions, viewsets, routes, docs and
-tests). Every generated resource is traced back to its requirement IDs, and the
-generated test suite is executed against SQLite after generation.
+runnable DRF app - models, serializers, JWT auth, role-based permissions, a
+service layer with transactions, a structured error handler, file uploads,
+search/filtering, docs and tests. Every generated resource is traced back to
+its requirement id, and the generated suite is executed against SQLite and, when
+a MySQL server is reachable, against MySQL as well.
+
+The generation plan and the harness results are validated through the pydantic
+models in ``schemas.py`` before anything is written or persisted.
 """
-import re
+import json
+import os
 import subprocess
 import sys
 import tempfile
+from functools import lru_cache
 from pathlib import Path
+
+from . import templates
+from .schemas import GenerationPlan, GenerationResult, HarnessRun, ResourceSpec
 
 # Phrases stripped from the front of a requirement title to find the resource.
 _FILLER_PREFIXES = [
@@ -42,268 +52,27 @@ def derive_resource(title: str) -> str:
         if text.startswith(filler):
             text = text[len(filler):].strip()
             break
-    words = [w for w in re.split(r"[^a-z0-9]+", text) if w]
+    words = [w for w in re_split(text) if w]
     words = [w for w in words if w not in _STOP_WORDS][:3] or ["item"]
     return "_".join(words)
+
+
+def re_split(text: str) -> list[str]:
+    import re
+
+    return re.split(r"[^a-z0-9]+", text)
 
 
 def class_name(resource: str) -> str:
     return "".join(w.capitalize() for w in resource.split("_"))
 
 
-def _plural(resource: str) -> str:
-    if resource.endswith("s"):
-        return resource
-    if resource.endswith("y"):
-        return resource[:-1] + "ies"
-    return resource + "s"
-
-
-def _model(resource: str, name: str) -> str:
-    return f'''from django.conf import settings
-from django.db import models
-
-
-class {name}(models.Model):
-    """Generated from the approved requirements (trace_rids in docs)."""
-
-    owner = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="{_plural(resource)}"
-    )
-    name = models.CharField(max_length=200)
-    description = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        ordering = ["-created_at"]
-
-    def __str__(self):
-        return self.name
-'''
-
-
-def _serializers(name: str) -> str:
-    return f'''from rest_framework import serializers
-
-from .models import {name}
-
-
-class {name}Serializer(serializers.ModelSerializer):
-    class Meta:
-        model = {name}
-        fields = ["id", "name", "description", "created_at", "updated_at"]
-        read_only_fields = ["created_at", "updated_at"]
-'''
-
-
-def _permissions() -> str:
-    return '''from rest_framework import permissions
-
-
-class IsOwner(permissions.BasePermission):
-    """Only the owner of an object may read or change it."""
-
-    def has_object_permission(self, request, view, obj):
-        return obj.owner_id == request.user.id
-'''
-
-
-def _views(name: str, serializer: str) -> str:
-    return f'''from rest_framework import permissions, viewsets
-
-from .models import {name}
-from .permissions import IsOwner
-from .serializers import {serializer}Serializer
-
-
-class {name}ViewSet(viewsets.ModelViewSet):
-    """CRUD API for {name}, scoped to the requesting user."""
-
-    serializer_class = {serializer}Serializer
-    permission_classes = [permissions.IsAuthenticated, IsOwner]
-
-    def get_queryset(self):
-        return {name}.objects.filter(owner=self.request.user)
-
-    def perform_create(self, serializer):
-        serializer.save(owner=self.request.user)
-'''
-
-
-def _urls(route: str, name: str) -> str:
-    return f'''from rest_framework.routers import DefaultRouter
-
-from .views import {name}ViewSet
-
-router = DefaultRouter()
-router.register(r"{route}", {name}ViewSet, basename="{route}")
-
-urlpatterns = router.urls
-'''
-
-
-def _tests(name: str, route: str) -> str:
-    return f'''from django.contrib.auth import get_user_model
-from django.urls import reverse
-from rest_framework import test
-
-from .models import {name}
-
-
-class {name}APITests(test.APITestCase):
-    def setUp(self):
-        self.user = get_user_model().objects.create_user(
-            username="owner", email="owner@example.com", password="strong-pass-123"
-        )
-        self.client.force_authenticate(self.user)
-        self.list_url = reverse("{route}-list")
-
-    def _create(self):
-        return self.client.post(
-            self.list_url, {{"name": "Sample", "description": "d"}}, format="json"
-        )
-
-    def test_unauthenticated_access_is_denied(self):
-        anon = test.APIClient()
-        self.assertEqual(anon.get(self.list_url).status_code, 401)
-
-    def test_owner_can_create_and_retrieve(self):
-        res = self._create()
-        self.assertEqual(res.status_code, 201, res.data)
-        res = self.client.get(self.list_url)
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(len(res.data["results"]), 1)
-
-    def test_owner_can_update_and_delete(self):
-        self._create()
-        detail_url = reverse("{route}-detail", args=[1])
-        self.assertEqual(
-            self.client.patch(detail_url, {{"name": "Changed"}}, format="json").status_code, 200
-        )
-        self.assertEqual(self.client.delete(detail_url).status_code, 204)
-
-    def test_other_user_cannot_see_object(self):
-        self._create()
-        other = get_user_model().objects.create_user(
-            username="other", email="other@example.com", password="strong-pass-123"
-        )
-        self.client.force_authenticate(other)
-        detail_url = reverse("{route}-detail", args=[1])
-        self.assertIn(self.client.get(detail_url).status_code, (403, 404))
-'''
-
-
-def _docs(project, resources) -> str:
-    lines = [
-        f"# Generated backend - {project.name}",
-        "",
-        f"Generated by SpecForge AI Phase 4 on approval of {project.name}.",
-        "",
-        "## Endpoint inventory",
-        "",
-        "| Requirement | Resource | Endpoints |",
-        "|---|---|---|",
-    ]
-    for r in resources:
-        lines.append(f"| {r['rid']} ({r['title']}) | `{r['route']}` | {', '.join(f'`{e}`' for e in r['endpoints'])} |")
-    lines += ["", "## Permissions", "",
-              "Every endpoint requires authentication and is scoped to the owning user",
-              "(`IsOwner`).", ""]
-    nf = project.requirements.filter(req_type="non_functional", status="approved")
-    if nf.exists():
-        lines += ["## Non-functional requirements carried through", ""]
-        lines += [f"- **{req.rid}** {req.title}: {req.description}" for req in nf]
-        lines.append("")
-    return "\n".join(lines)
-
-
-def _trace_map(resources) -> str:
-    import json
-    return json.dumps(resources, indent=2)
-
-
-def _harness_files(resources) -> dict:
-    urls_imports = "\n".join(f"from .views import {r['class_name']}ViewSet" for r in resources)
-    router_lines = "\n".join(
-        f'router.register(r"{r["route"]}", {r["class_name"]}ViewSet, basename="{r["route"]}")'
-        for r in resources
-    )
-    root_urls = f'''from django.urls import include, path
-from rest_framework.routers import DefaultRouter
-
-{urls_imports}
-
-router = DefaultRouter()
-{router_lines}
-
-urlpatterns = [path("api/", include(router.urls))]
-'''
-    settings_py = '''SECRET_KEY = "generated-harness-only"
-DEBUG = True
-ALLOWED_HOSTS = ["*"]
-INSTALLED_APPS = [
-    "django.contrib.contenttypes",
-    "django.contrib.auth",
-    "django.contrib.sessions",
-    "rest_framework",
-    "backendapp",
-]
-DATABASES = {
-    "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "harness.sqlite3"}
-}
-ROOT_URLCONF = "backendapp.urls"
-USE_TZ = True
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework.authentication.BasicAuthentication",
-        "rest_framework.authentication.SessionAuthentication",
-    ),
-
-    "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
-    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
-    "PAGE_SIZE": 50,
-    "TEST_RUNNER": "django.test.runner.DiscoverRunner",
-}
-'''
-    manage_py = '''#!/usr/bin/env python
-import os
-import sys
-
-
-def main():
-    os.environ["DJANGO_SETTINGS_MODULE"] = "settings"
-    from django.core.management import execute_from_command_line
-    execute_from_command_line(sys.argv)
-
-
-if __name__ == "__main__":
-    main()
-'''
-    apps_py = '''from django.apps import AppConfig
-
-
-class BackendappConfig(AppConfig):
-    name = "backendapp"
-'''
-    return {
-        "settings.py": settings_py,
-        "manage.py": manage_py,
-        "backendapp/apps.py": apps_py,
-        "backendapp/urls.py": root_urls,
-    }
-
-
-def generate_backend(project, user) -> dict:
-    """Build the generated app for an approved project and run its tests.
-
-    Returns a dict: {status, resources, artifacts, tests_passed, test_output, harness_dir}
-    """
+def _resource_specs(project) -> list[ResourceSpec]:
     approved = project.requirements.filter(status="approved")
     functional = [r for r in approved if r.req_type == "functional"]
 
-    resources, seen = [], {}
+    specs: list[ResourceSpec] = []
+    seen: set[str] = set()
     for req in functional:
         base = derive_resource(req.title)
         n = 2
@@ -311,79 +80,198 @@ def generate_backend(project, user) -> dict:
         while route in seen:
             route = f"{base}_{n}"
             n += 1
-        seen[route] = True
-        name = class_name(base)
-        resources.append({
-            "rid": req.rid,
-            "title": req.title,
-            "priority": req.priority,
-            "resource": base,
-            "route": route,
-            "class_name": name,
-            "endpoints": [
-                f"GET /api/{route}/",
-                f"POST /api/{route}/",
-                f"GET /api/{route}/{{id}}/",
-                f"PATCH /api/{route}/{{id}}/",
-                f"DELETE /api/{route}/{{id}}/",
-            ],
-        })
+        seen.add(route)
+        specs.append(
+            ResourceSpec(
+                rid=req.rid,
+                title=req.title,
+                priority=req.priority,
+                resource=base,
+                route=route,
+                class_name=class_name(base),
+                endpoints=[
+                    f"GET /api/{route}/",
+                    f"POST /api/{route}/",
+                    f"GET /api/{route}/{{id}}/",
+                    f"PATCH /api/{route}/{{id}}/",
+                    f"PUT /api/{route}/{{id}}/",
+                    f"DELETE /api/{route}/{{id}}/",
+                ],
+            )
+        )
+    return specs
 
-    artifacts: dict = {}
-    artifacts["backendapp/models.py"] = "\n\n".join(
-        _model(r["resource"], r["class_name"]) for r in resources
-    )
-    artifacts["backendapp/serializers.py"] = "\n\n".join(
-        _serializers(r["class_name"]) for r in resources
-    )
-    artifacts["backendapp/permissions.py"] = _permissions()
-    artifacts["backendapp/views.py"] = "\n\n".join(
-        _views(r["class_name"], r["class_name"]) for r in resources
-    )
-    artifacts["backendapp/tests.py"] = "\n\n".join(
-        _tests(r["class_name"], r["route"]) for r in resources
-    )
-    artifacts["backendapp/docs.md"] = _docs(project, resources)
-    artifacts["backendapp/requirements_map.json"] = _trace_map(resources)
-    for path, content in _harness_files(resources).items():
-        artifacts[path] = content
+
+def _build_artifacts(plan: GenerationPlan, project_name: str, databases_tested: list[str]) -> dict:
+    resources = plan.resources
+    return {
+        "manage.py": templates.manage_py(),
+        "settings.py": templates.settings_py(),
+        "requirements.txt": templates.requirements_txt(),
+        ".env.example": templates.env_example(),
+        "backendapp/__init__.py": "",
+        "backendapp/apps.py": templates.apps_py(),
+        "backendapp/config.py": templates.config_py(),
+        "backendapp/models.py": templates.models_py(resources),
+        "backendapp/serializers.py": templates.serializers_py(resources),
+        "backendapp/permissions.py": templates.permissions_py(),
+        "backendapp/services.py": templates.services_py(resources),
+        "backendapp/exceptions.py": templates.exceptions_py(),
+        "backendapp/middleware.py": templates.middleware_py(),
+        "backendapp/pagination.py": templates.pagination_py(),
+        "backendapp/filters.py": templates.filters_py(),
+        "backendapp/roles.py": templates.roles_py(),
+        "backendapp/signals.py": templates.signals_py(),
+        "backendapp/auth_views.py": templates.auth_views_py(),
+        "backendapp/views.py": templates.views_py(resources),
+        "backendapp/urls.py": templates.urls_py(resources),
+        "backendapp/tests.py": templates.tests_py(resources),
+        "backendapp/docs.md": templates.docs_md(project_name, resources, databases_tested),
+        "backendapp/requirements_map.json": json.dumps(
+            [r.model_dump() for r in resources], indent=2
+        ),
+    }
+
+
+def _mysql_env() -> dict:
+    """Connection settings for the local MySQL/MariaDB used by the harness run."""
+    return {
+        "host": os.environ.get("SPECFORGE_MYSQL_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("SPECFORGE_MYSQL_PORT") or 3306),
+        "user": os.environ.get("SPECFORGE_MYSQL_USER", "root"),
+        "password": os.environ.get("SPECFORGE_MYSQL_PASSWORD") or "root",
+    }
+
+
+@lru_cache(maxsize=1)
+def mysql_available() -> bool:
+    """True when a MySQL/MariaDB server answers and is not opted out."""
+    if os.environ.get("SPECFORGE_SKIP_MYSQL_TESTS") == "1":
+        return False
+    try:
+        import pymysql
+
+        conn = pymysql.connect(connect_timeout=3, **_mysql_env())
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _mysql_execute(statements: list[str]) -> None:
+    import pymysql
+
+    conn = pymysql.connect(connect_timeout=3, **_mysql_env())
+    try:
+        with conn.cursor() as cur:
+            for statement in statements:
+                cur.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run_harness(
+    harness_dir: Path, database: str = "sqlite", project_id: int = 0, timeout: int = 240
+) -> tuple[bool, str]:
+    """Run the generated app's real test suite on the selected database."""
+    env = os.environ.copy()
+    database_name = f"specforge_gen_{project_id}"
+    if database == "mysql":
+        config = _mysql_env()
+        env.update(
+            {
+                "GENERATED_DB_ENGINE": "mysql",
+                "MYSQL_DATABASE": database_name,
+                "MYSQL_HOST": str(config["host"]),
+                "MYSQL_PORT": str(config["port"]),
+                "MYSQL_USER": str(config["user"]),
+                "MYSQL_PASSWORD": str(config["password"]),
+            }
+        )
+        # Django opens the configured database before creating test_<name>.
+        _mysql_execute([f"CREATE DATABASE IF NOT EXISTS `{database_name}`"])
+    else:
+        env.update(
+            {
+                "GENERATED_DB_ENGINE": "sqlite",
+                "SQLITE_PATH": str(harness_dir / "harness.sqlite3"),
+            }
+        )
+
+    commands = [[sys.executable, "manage.py", "makemigrations", "backendapp"]]
+    commands.append([sys.executable, "manage.py", "test", "backendapp", "-v", "2", "--noinput"])
+    output_parts = [f"# database: {database}"]
+    try:
+        for cmd in commands:
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=harness_dir, capture_output=True, text=True, timeout=timeout, env=env
+                )
+                output_parts.append(f"$ {' '.join(cmd[1:])}\n{proc.stdout}\n{proc.stderr}")
+                if proc.returncode != 0:
+                    return False, "\n---\n".join(output_parts)
+            except subprocess.TimeoutExpired:
+                output_parts.append(f"$ {' '.join(cmd[1:])}\nTIMED OUT after {timeout}s")
+                return False, "\n---\n".join(output_parts)
+        return True, "\n---\n".join(output_parts)
+    finally:
+        if database == "mysql":
+            try:
+                _mysql_execute([f"DROP DATABASE IF EXISTS `{database_name}`"])
+            except Exception:
+                pass
+
+
+def generate_backend(project, user) -> dict:
+    """Build the generated app for an approved project and run its tests.
+
+    Returns a validated dict:
+    {status, resources, artifacts, tests_passed, test_output, databases_tested,
+     harness_dir}
+    """
+    plan = GenerationPlan(project_id=project.id, resources=_resource_specs(project))
+    artifacts = _build_artifacts(plan, project.name, ["sqlite"])
 
     harness_dir = Path(tempfile.mkdtemp(prefix=f"specforge_backend_{project.id}_"))
     for rel, content in artifacts.items():
         target = harness_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-    (harness_dir / "backendapp/__init__.py").write_text("")
-    # Hidden per-project record of where the artifacts were materialised.
-    artifacts["harness_dir"] = str(harness_dir)
 
-    tests_passed, output = _run_harness(harness_dir)
+    runs: list[HarnessRun] = []
+    sqlite_passed, sqlite_output = _run_harness(harness_dir, "sqlite", project.id)
+    runs.append(HarnessRun(database="sqlite", passed=sqlite_passed, output=sqlite_output))
+
+    if sqlite_passed and mysql_available():
+        mysql_passed, mysql_output = _run_harness(harness_dir, "mysql", project.id, timeout=300)
+        runs.append(HarnessRun(database="mysql", passed=mysql_passed, output=mysql_output))
+
+    databases_tested = [run.database for run in runs if run.passed]
+    tests_passed = all(run.passed for run in runs)
+
+    result = GenerationResult(
+        project_id=project.id,
+        status="success" if tests_passed else "failed",
+        resources=plan.resources,
+        tests_passed=tests_passed,
+        databases_tested=databases_tested or ["sqlite"],
+        outputs=runs,
+    )
+
+    docs = templates.docs_md(project.name, plan.resources, result.databases_tested)
+    artifacts["backendapp/docs.md"] = docs
+    (harness_dir / "backendapp/docs.md").write_text(docs, encoding="utf-8")
+
+    artifacts["harness_dir"] = str(harness_dir)
     return {
-        "status": "success" if tests_passed else "failed",
-        "resources": resources,
+        "status": result.status,
+        "resources": [r.model_dump() for r in result.resources],
         "artifacts": artifacts,
-        "tests_passed": tests_passed,
-        "test_output": output,
+        "tests_passed": result.tests_passed,
+        "test_output": "\n\n".join(
+            f"===== {run.database} =====\n{run.output}" for run in runs
+        ),
+        "databases_tested": result.databases_tested,
         "harness_dir": str(harness_dir),
     }
-
-
-def _run_harness(harness_dir: Path, timeout: int = 180) -> tuple[bool, str]:
-    env_python = sys.executable
-    commands = [
-        [env_python, "manage.py", "makemigrations", "backendapp"],
-        [env_python, "manage.py", "test", "backendapp", "-v", "1", "--noinput"],
-    ]
-    output_parts = []
-    for cmd in commands:
-        try:
-            proc = subprocess.run(
-                cmd, cwd=harness_dir, capture_output=True, text=True, timeout=timeout
-            )
-            output_parts.append(f"$ {' '.join(cmd[1:])}\n{proc.stdout}\n{proc.stderr}")
-            if proc.returncode != 0:
-                return False, "\n---\n".join(output_parts)
-        except subprocess.TimeoutExpired:
-            output_parts.append(f"$ {' '.join(cmd[1:])}\nTIMED OUT after {timeout}s")
-            return False, "\n---\n".join(output_parts)
-    return True, "\n---\n".join(output_parts)

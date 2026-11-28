@@ -41,12 +41,44 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             "id", "username", "email", "role", "role_name",
-            "permissions", "is_admin_role", "last_login",
+            "permissions", "is_admin_role", "is_active", "email_verified",
+            "date_joined", "last_login",
         ]
-        read_only_fields = ["username", "email", "role"]
+        read_only_fields = [
+            "username", "email", "role", "is_active", "email_verified", "date_joined",
+        ]
 
     def get_permissions(self, obj):
         return sorted(obj.permission_codenames)
+
+
+class PasswordChangeSerializer(serializers.Serializer):
+    current_password = serializers.CharField(write_only=True)
+    new_password = serializers.CharField(write_only=True, min_length=8)
+
+
+class ProfileUpdateSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(required=False)
+
+    class Meta:
+        model = User
+        fields = ["email"]
+
+    def validate_email(self, value):
+        clash = User.objects.filter(email__iexact=value).exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError("A user with that email already exists.")
+        return value
+
+    def update(self, instance, validated_data):
+        new_email = validated_data.get("email")
+        if new_email and new_email.lower() != instance.email.lower():
+            instance.email = new_email
+            instance.email_verified = False
+            instance.save(update_fields=["email", "email_verified"])
+            return instance
+        validated_data.pop("email", None)
+        return super().update(instance, validated_data)
 
 
 class RoleSerializer(serializers.ModelSerializer):

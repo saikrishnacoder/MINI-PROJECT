@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { LogOut } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth";
@@ -41,7 +42,11 @@ export default function Projects() {
               Admin
             </Link>
           )}
-          <button onClick={logout} className="text-sm text-slate-400 hover:text-slate-200">
+          <Link to="/profile" className="font-mono text-xs text-slate-400 hover:text-slate-200 uppercase tracking-wider">
+            Profile
+          </Link>
+          <button onClick={logout} className="flex items-center gap-1.5 text-sm text-slate-400 hover:text-slate-200">
+            <LogOut size={14} aria-hidden />
             Sign out
           </button>
         </div>

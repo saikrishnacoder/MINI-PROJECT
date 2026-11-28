@@ -26,6 +26,13 @@ class User(AbstractUser):
     role = models.ForeignKey(
         Role, null=True, blank=True, on_delete=models.SET_NULL, related_name="users"
     )
+    email_verified = models.BooleanField(
+        default=False, help_text="Set once the address is confirmed via the emailed link."
+    )
+    email_verification_token = models.CharField(
+        max_length=64, blank=True, db_index=True
+    )
+    email_verification_sent_at = models.DateTimeField(null=True, blank=True)
 
     REQUIRED_FIELDS = ["email"]
 
@@ -54,6 +61,10 @@ class ActivityLog(models.Model):
         REGISTER = "register", "Registration"
         PASSWORD_RESET_REQUEST = "password_reset_request", "Password reset requested"
         PASSWORD_RESET = "password_reset", "Password reset"
+        PASSWORD_CHANGE = "password_change", "Password changed"
+        EMAIL_VERIFICATION_SENT = "email_verification_sent", "Verification email sent"
+        EMAIL_VERIFIED = "email_verified", "Email verified"
+        ACCOUNT_STATUS = "account_status", "Account status changed"
         ROLE_CHANGE = "role_change", "Role changed"
         ROLE_CHANGE_FAILED = "role_change_failed", "Role change denied"
 

@@ -72,9 +72,25 @@ def test_frontend_generation_builds_real_app_and_trace_links(client):
         "src/auth.tsx", "src/pages/Login.tsx", "src/pages/Register.tsx",
         "src/pages/Dashboard.tsx", "src/pages/ResourceListPage.tsx",
         "src/pages/NotFound.tsx", "src/resources.ts", "docs.md",
-        "requirements_map.json",
+        "requirements_map.json", "src/queries.ts", "src/preferences.tsx",
+        "src/components/Toast.tsx", "src/pages/Landing.tsx",
+        "src/pages/Profile.tsx", "src/pages/Settings.tsx",
     ):
         assert path in data["artifacts"], path
+    # the generated app uses the query library, icon set, toasts and filters it ships
+    pkg = data["artifacts"]["package.json"]
+    assert "@tanstack/react-query" in pkg and "lucide-react" in pkg
+    queries = data["artifacts"]["src/queries.ts"]
+    assert "useQuery" in queries and "useMutation" in queries
+    app = data["artifacts"]["src/App.tsx"]
+    for route in ('path="/dashboard"', 'path="/profile"', 'path="/settings"'):
+        assert route in app, route
+    toast = data["artifacts"]["src/components/Toast.tsx"]
+    assert 'role="status"' in toast and "aria-live" in toast
+    listing = data["artifacts"]["src/pages/ResourceListPage.tsx"]
+    for control in ("created_after", "created_before", "ordering", "Clear filters"):
+        assert control in listing, control
+    assert "APP_NAME" in data["artifacts"]["src/pages/Landing.tsx"]
     # every generated page is traced to its requirement ID in the docs and registry
     assert "REQ-001" in data["artifacts"]["docs.md"]
     registry = data["artifacts"]["src/resources.ts"]

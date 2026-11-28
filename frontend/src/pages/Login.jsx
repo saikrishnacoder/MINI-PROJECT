@@ -1,14 +1,22 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth";
 
 export default function Login() {
   const { login, register } = useAuth();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
   const [mode, setMode] = useState("login");
   const [form, setForm] = useState({ username: "", email: "", password: "" });
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [notice] = useState(
+    params.get("verified")
+      ? "Email verified. Sign in with your credentials."
+      : params.get("changed")
+        ? "Password updated. Sign in with the new password."
+        : ""
+  );
 
   async function submit(e) {
     e.preventDefault();
@@ -41,6 +49,11 @@ export default function Login() {
         <p className="text-sm text-slate-400">
           {mode === "login" ? "Sign in to your workspace" : "Create your workspace account"}
         </p>
+        {notice && !error && (
+          <p aria-live="polite" className="text-sm text-emerald-300 bg-emerald-950/50 border border-emerald-900 rounded-lg px-3 py-2">
+            {notice}
+          </p>
+        )}
         {error && <p className="text-sm text-rose-400 bg-rose-950/50 rounded-lg px-3 py-2">{error}</p>}
         <input className={input} placeholder="Username" value={form.username}
           onChange={(e) => setForm({ ...form, username: e.target.value })} required />

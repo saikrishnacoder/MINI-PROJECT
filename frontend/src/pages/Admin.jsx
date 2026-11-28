@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { UserCheck, UserX } from "lucide-react";
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useAuth } from "../auth";
 
 export default function Admin() {
-  const { api, isAdmin } = useAuth();
+  const { api, isAdmin, user: me } = useAuth();
   const qc = useQueryClient();
   const [tab, setTab] = useState("users");
   const [newRole, setNewRole] = useState({ name: "", description: "", is_admin: false });
@@ -50,6 +52,14 @@ export default function Admin() {
       qc.invalidateQueries({ queryKey: ["activity"] });
     },
   });
+  const setStatus = useMutation({
+    mutationFn: async ({ userId, isActive }) =>
+      (await api.post(`/users/${userId}/set_status/`, { is_active: isActive })).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      qc.invalidateQueries({ queryKey: ["activity"] });
+    },
+  });
 
   const input =
     "w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2 text-sm focus:outline-none focus:border-indigo-500";
@@ -64,8 +74,12 @@ export default function Admin() {
 
   return (
     <div className="p-4 sm:p-8 max-w-4xl mx-auto">
-      <div className="flex items-center gap-2 mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
         <p className="font-mono text-xs uppercase tracking-widest text-emerald-400">SpecForge AI — Administration</p>
+        <nav className="flex items-center gap-4 text-sm">
+          <Link to="/" className="text-slate-400 hover:text-slate-200">Projects</Link>
+          <Link to="/profile" className="text-slate-400 hover:text-slate-200">Profile</Link>
+        </nav>
       </div>
       <div className="flex gap-2 mb-4">
         <button className={tabCls(tab === "users")} onClick={() => setTab("users")}>Users &amp; roles</button>
@@ -107,7 +121,7 @@ export default function Admin() {
                             className={`font-mono text-xs rounded px-2 py-1 border ${
                               on
                                 ? "bg-emerald-900/50 text-emerald-300 border-emerald-700"
-                                : "bg-slate-800 text-slate-500 border-slate-700 hover:text-slate-300"
+                                : "bg-slate-800 text-slate-300 border-slate-700 hover:text-white"
                             }`}>
                             {p}
                           </button>
@@ -142,26 +156,61 @@ export default function Admin() {
               <div className="space-y-2">
                 {userList.map((u) => (
                   <div key={u.id} className="flex flex-wrap items-center justify-between gap-2 bg-slate-800/60 rounded-lg px-3 py-2">
-                    <div>
-                      <span className="text-sm text-slate-100">{u.username}</span>
-                      <span className="ml-2 text-xs text-slate-400">{u.email}</span>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className={`text-sm ${u.is_active ? "text-slate-100" : "text-slate-500 line-through"}`}>
+                          {u.username}
+                        </span>
+                        <span className="font-mono text-[11px] rounded-full px-2 py-0.5 bg-slate-900 text-slate-400 border border-slate-700">
+                          {u.is_active ? "active" : "deactivated"}
+                        </span>
+                        <span
+                          className={`font-mono text-[11px] rounded-full px-2 py-0.5 ${
+                            u.email_verified
+                              ? "bg-emerald-900/60 text-emerald-300"
+                              : "bg-amber-900/60 text-amber-300"
+                          }`}>
+                          {u.email_verified ? "verified" : "unverified"}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-400 break-all">{u.email}</p>
                     </div>
-                    <select
-                      className="rounded-lg bg-slate-800 border border-slate-700 px-2 py-1 text-sm"
-                      value={u.role || ""}
-                      disabled={setRole.isPending}
-                      onChange={(e) => setRole.mutate({ userId: u.id, role: e.target.value })}>
-                      <option value="">No role</option>
-                      {roleList.map((r) => (
-                        <option key={r.id} value={r.name}>{r.name}</option>
-                      ))}
-                    </select>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        className="rounded-lg bg-slate-800 border border-slate-700 px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
+                        value={u.role_name || ""}
+                        aria-label={`Role for ${u.username}`}
+                        disabled={setRole.isPending}
+                        onChange={(e) => setRole.mutate({ userId: u.id, role: e.target.value })}>
+                        <option value="">No role</option>
+                        {roleList.map((r) => (
+                          <option key={r.id} value={r.name}>{r.name}</option>
+                        ))}
+                      </select>
+                      <button
+                        className={`inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:opacity-40 ${
+                          u.is_active
+                            ? "border-rose-800 text-rose-300 hover:bg-rose-950/50"
+                            : "border-emerald-800 text-emerald-300 hover:bg-emerald-950/50"
+                        }`}
+                        disabled={setStatus.isPending}
+                        title={u.username === me?.username ? "You cannot change your own status" : undefined}
+                        onClick={() => setStatus.mutate({ userId: u.id, isActive: !u.is_active })}>
+                        {u.is_active ? <UserX size={13} aria-hidden /> : <UserCheck size={13} aria-hidden />}
+                        {u.is_active ? "Deactivate" : "Activate"}
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
               {setRole.error && (
                 <p className="mt-2 text-sm text-rose-400">
                   {setRole.error.response?.data?.detail || "Could not assign role."}
+                </p>
+              )}
+              {setStatus.error && (
+                <p className="mt-2 text-sm text-rose-400" role="alert">
+                  {setStatus.error.response?.data?.detail || "Could not change the account status."}
                 </p>
               )}
             </section>

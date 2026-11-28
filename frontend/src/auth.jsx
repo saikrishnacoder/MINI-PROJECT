@@ -68,12 +68,18 @@ export function AuthProvider({ children }) {
       });
       setMe(meRes.data);
     }
+    async function refreshUser() {
+      const res = await api.get("/auth/me/");
+      setMe(res.data);
+      return res.data;
+    }
     return {
       token,
       api,
       user: me,
       isAdmin: Boolean(me?.is_admin_role),
       login: doLogin,
+      refreshUser,
       async register(username, email, password) {
         await axios.post("/api/auth/register/", { username, email, password });
         return doLogin(username, password);

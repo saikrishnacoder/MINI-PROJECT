@@ -71,8 +71,12 @@ def test_generation_produces_runnable_backend_and_trace_links(client):
         "backendapp/models.py", "backendapp/serializers.py", "backendapp/views.py",
         "backendapp/urls.py", "backendapp/permissions.py", "backendapp/docs.md",
         "backendapp/tests.py", "backendapp/requirements_map.json",
+        "backendapp/services.py", "backendapp/exceptions.py", "backendapp/auth_views.py",
+        "backendapp/config.py", "backendapp/filters.py", "backendapp/pagination.py",
+        "backendapp/middleware.py", "backendapp/roles.py", "backendapp/signals.py",
     ):
         assert path in data["artifacts"], path
+    assert "sqlite" in data["databases_tested"]
     assert "REQ-001" in data["artifacts"]["backendapp/docs.md"]
     # trace map is valid JSON keyed by rid
     trace_map = json.loads(data["artifacts"]["backendapp/requirements_map.json"])
@@ -112,6 +116,7 @@ def test_get_generated_backend(client):
     res = client.get(reverse(DETAIL, args=[project.pk]))
     assert res.status_code == 200
     assert res.data["status"] == "success"
+    assert "sqlite" in res.data["databases_tested"]
 
 
 def test_cannot_generate_for_other_users_project(client, django_user_model):

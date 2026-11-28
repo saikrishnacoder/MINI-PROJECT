@@ -79,6 +79,12 @@ DATABASES = {
     }
 }
 
+# Each test process gets its own database so overlapping or parallel runs cannot
+# drop the schema another run is using. The specforge user is granted test_specforge%.*
+DATABASES["default"].setdefault("TEST", {})["NAME"] = os.environ.get(
+    "TEST_DB_NAME", f"test_specforge_{os.getpid()}"
+)
+
 AUTH_USER_MODEL = "accounts.User"
 
 AUTH_PASSWORD_VALIDATORS = [

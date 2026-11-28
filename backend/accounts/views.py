@@ -4,6 +4,7 @@ from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.db.models import Q
+from django.utils import timezone
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from rest_framework import permissions, status, viewsets
@@ -15,17 +16,63 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+import logging
+import secrets
+
+logger = logging.getLogger(__name__)
+
 from .activity import log_activity
 from .models import ActivityLog, Role
 from .permissions import IsAdminRole
 from .serializers import (
     ActivityLogSerializer,
+    PasswordChangeSerializer,
+    ProfileUpdateSerializer,
     RegisterSerializer,
     RoleSerializer,
     UserSerializer,
 )
 
 User = get_user_model()
+
+
+def blacklist_tokens(user):
+    """Revoke every outstanding refresh token for an account."""
+    from rest_framework_simplejwt.token_blacklist.models import (
+        BlacklistedToken, OutstandingToken,
+    )
+
+    for outstanding in OutstandingToken.objects.filter(user=user):
+        BlacklistedToken.objects.get_or_create(token=outstanding)
+
+
+def password_errors(password, user):
+    try:
+        validate_password(password, user)
+    except Exception as exc:
+        return getattr(exc, "messages", None) or [str(exc)]
+    return []
+
+
+def send_verification_email(user, request=None):
+    """Issue a fresh verification token, email the link and return it."""
+    user.email_verification_token = secrets.token_urlsafe(32)
+    user.email_verification_sent_at = timezone.now()
+    user.save(update_fields=["email_verification_token", "email_verification_sent_at"])
+    verify_url = f"{settings.FRONTEND_URL}/verify-email?token={user.email_verification_token}"
+    try:
+        send_mail(
+            "Verify your SpecForge AI email address",
+            "Confirm this address to finish setting up your account:\n\n"
+            f"{verify_url}\n\nIf you did not create an account, ignore this email.",
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+        )
+    except Exception:  # a broken mail server must not fail registration
+        logger.exception("Could not send verification email to %s", user.email)
+
+    log_activity(user, ActivityLog.Action.EMAIL_VERIFICATION_SENT, request, user.email)
+    return verify_url
 
 
 class RegisterView(APIView):
@@ -36,7 +83,55 @@ class RegisterView(APIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         log_activity(user, ActivityLog.Action.REGISTER, request, "Account created")
-        return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
+        body = dict(UserSerializer(user).data)
+        verify_url = send_verification_email(user, request)
+        body["detail"] = "Account created. Check your email to verify the address."
+        if settings.DEBUG:
+            body["verification_url"] = verify_url
+        return Response(body, status=status.HTTP_201_CREATED)
+
+
+class EmailVerificationConfirmView(APIView):
+    """Consume the token from the verification email and confirm the address."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        token = (request.data.get("token") or "").strip()
+        if not token:
+            return Response({"token": ["A verification token is required."]}, status=400)
+        user = User.objects.filter(email_verification_token=token).first()
+        if user is None:
+            return Response(
+                {"detail": "This verification link is invalid or has already been used."},
+                status=400,
+            )
+        user.email_verified = True
+        user.email_verification_token = ""
+        user.save(update_fields=["email_verified", "email_verification_token"])
+        log_activity(user, ActivityLog.Action.EMAIL_VERIFIED, request, user.email)
+        return Response(
+            {"detail": "Email verified. You can sign in normally.", "email": user.email}
+        )
+
+
+class EmailVerificationRequestView(APIView):
+    """Send (or resend) the verification link for an address."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = (request.data.get("email") or "").strip()
+        user = User.objects.filter(email__iexact=email, is_active=True).first()
+        detail = "If that address needs verification, a new link has been sent."
+        body = {"detail": detail}
+        if user is not None and not user.email_verified:
+            verify_url = send_verification_email(user, request)
+            if settings.DEBUG:
+                body["verification_url"] = verify_url
+        elif user is not None:
+            body["detail"] = "That address is already verified."
+        return Response(body)
 
 
 class LoginView(TokenObtainPairView):
@@ -44,6 +139,22 @@ class LoginView(TokenObtainPairView):
 
     def post(self, request, *args, **kwargs):
         user = User.objects.filter(username=request.data.get("username", "")).first()
+        if (
+            user is not None
+            and not user.is_active
+            and user.check_password(request.data.get("password", ""))
+        ):
+            log_activity(
+                user,
+                ActivityLog.Action.LOGIN,
+                request,
+                "Login blocked (account deactivated)",
+                status_code=403,
+            )
+            return Response(
+                {"detail": "This account has been deactivated. Contact an administrator."},
+                status=403,
+            )
         try:
             response = super().post(request, *args, **kwargs)
         except Exception as exc:
@@ -142,14 +253,40 @@ class PasswordResetConfirmView(APIView):
         user.set_password(password)
         user.save(update_fields=["password"])
         # Invalidate every outstanding refresh token for this account.
-        from rest_framework_simplejwt.token_blacklist.models import (
-            OutstandingToken, BlacklistedToken,
-        )
-
-        for outstanding in OutstandingToken.objects.filter(user=user):
-            BlacklistedToken.objects.get_or_create(token=outstanding)
+        blacklist_tokens(user)
         log_activity(
             user, ActivityLog.Action.PASSWORD_RESET, request, "Password changed via reset link"
+        )
+        return Response({"detail": "Password updated. Please sign in again."})
+
+
+class PasswordChangeView(APIView):
+    """Self-service password change for a signed-in user."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = PasswordChangeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        current = serializer.validated_data["current_password"]
+        new = serializer.validated_data["new_password"]
+        if not request.user.check_password(current):
+            return Response(
+                {"current_password": ["That is not your current password."]}, status=400
+            )
+        if current == new:
+            return Response(
+                {"new_password": ["Choose a password different from the current one."]},
+                status=400,
+            )
+        errors = password_errors(new, request.user)
+        if errors:
+            return Response({"new_password": errors}, status=400)
+        request.user.set_password(new)
+        request.user.save(update_fields=["password"])
+        blacklist_tokens(request.user)
+        log_activity(
+            request.user, ActivityLog.Action.PASSWORD_CHANGE, request, "Password changed"
         )
         return Response({"detail": "Password updated. Please sign in again."})
 
@@ -159,6 +296,18 @@ class MeView(APIView):
 
     def get(self, request):
         return Response(UserSerializer(request.user).data)
+
+    def patch(self, request):
+        serializer = ProfileUpdateSerializer(
+            request.user, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        body = dict(UserSerializer(user).data)
+        if request.data.get("email") and not user.email_verified:
+            body["verification_url"] = send_verification_email(user, request)
+            body["detail"] = "Email updated. Verify the new address from your inbox."
+        return Response(body)
 
 
 class RoleViewSet(viewsets.ModelViewSet):
@@ -248,6 +397,43 @@ class UserViewSet(viewsets.ReadOnlyModelViewSet):
             ActivityLog.Action.ROLE_CHANGE,
             request,
             f"Changed role of '{target.username}': {old or 'none'} -> {role.name}",
+        )
+        return Response(UserSerializer(target).data)
+
+    @action(detail=True, methods=["post"])
+    def set_status(self, request, pk=None):
+        """Activate or deactivate an account. Deactivation revokes its tokens."""
+        target = self.get_object()
+        desired = request.data.get("is_active")
+        if not isinstance(desired, bool):
+            return Response({"is_active": ["Send true or false."]}, status=400)
+        if target == request.user:
+            return Response(
+                {"detail": "You cannot deactivate your own account (lock-out protection)."},
+                status=400,
+            )
+        if not desired and target.is_admin_role:
+            other_admins = (
+                User.objects.filter(is_active=True, role__is_admin=True)
+                .exclude(pk=target.pk)
+                .count()
+            )
+            if other_admins == 0:
+                return Response(
+                    {"detail": "At least one active administrator must remain."}, status=400
+                )
+        if target.is_active == desired:
+            return Response(UserSerializer(target).data)
+
+        target.is_active = desired
+        target.save(update_fields=["is_active"])
+        if not desired:
+            blacklist_tokens(target)
+        log_activity(
+            request.user,
+            ActivityLog.Action.ACCOUNT_STATUS,
+            request,
+            f"{'Activated' if desired else 'Deactivated'} account '{target.username}'",
         )
         return Response(UserSerializer(target).data)
 
