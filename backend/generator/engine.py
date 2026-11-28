@@ -18,7 +18,7 @@ import tempfile
 from functools import lru_cache
 from pathlib import Path
 
-from . import templates
+from . import business, templates
 from .schemas import GenerationPlan, GenerationResult, HarnessRun, ResourceSpec
 
 # Phrases stripped from the front of a requirement title to find the resource.
@@ -81,6 +81,22 @@ def _resource_specs(project) -> list[ResourceSpec]:
             route = f"{base}_{n}"
             n += 1
         seen.add(route)
+        capabilities = business.detect_capabilities(req.title, req.description)
+        endpoints = [
+            f"GET /api/{route}/",
+            f"POST /api/{route}/",
+            f"GET /api/{route}/{{id}}/",
+            f"PATCH /api/{route}/{{id}}/",
+            f"PUT /api/{route}/{{id}}/",
+            f"DELETE /api/{route}/{{id}}/",
+        ]
+        if "workflow" in capabilities:
+            endpoints += [
+                f"POST /api/{route}/{{id}}/transition/",
+                f"GET /api/{route}/{{id}}/history/",
+            ]
+        if "payments" in capabilities:
+            endpoints.append(f"POST /api/{route}/{{id}}/checkout/")
         specs.append(
             ResourceSpec(
                 rid=req.rid,
@@ -89,21 +105,22 @@ def _resource_specs(project) -> list[ResourceSpec]:
                 resource=base,
                 route=route,
                 class_name=class_name(base),
-                endpoints=[
-                    f"GET /api/{route}/",
-                    f"POST /api/{route}/",
-                    f"GET /api/{route}/{{id}}/",
-                    f"PATCH /api/{route}/{{id}}/",
-                    f"PUT /api/{route}/{{id}}/",
-                    f"DELETE /api/{route}/{{id}}/",
-                ],
+                capabilities=capabilities,
+                endpoints=endpoints,
             )
         )
     return specs
 
 
-def _build_artifacts(plan: GenerationPlan, project_name: str, databases_tested: list[str]) -> dict:
+def _build_artifacts(
+    plan: GenerationPlan,
+    project_name: str,
+    databases_tested: list[str],
+    feature_matrix: dict | None = None,
+) -> dict:
     resources = plan.resources
+    features = (feature_matrix or {}).get("features", [])
+    summary = (feature_matrix or {}).get("summary", {})
     return {
         "manage.py": templates.manage_py(),
         "settings.py": templates.settings_py(),
@@ -116,6 +133,8 @@ def _build_artifacts(plan: GenerationPlan, project_name: str, databases_tested: 
         "backendapp/serializers.py": templates.serializers_py(resources),
         "backendapp/permissions.py": templates.permissions_py(),
         "backendapp/services.py": templates.services_py(resources),
+        "backendapp/integrations.py": templates.integrations_py(),
+        "backendapp/features.py": templates.features_py(features, summary),
         "backendapp/exceptions.py": templates.exceptions_py(),
         "backendapp/middleware.py": templates.middleware_py(),
         "backendapp/pagination.py": templates.pagination_py(),
@@ -126,7 +145,9 @@ def _build_artifacts(plan: GenerationPlan, project_name: str, databases_tested: 
         "backendapp/views.py": templates.views_py(resources),
         "backendapp/urls.py": templates.urls_py(resources),
         "backendapp/tests.py": templates.tests_py(resources),
-        "backendapp/docs.md": templates.docs_md(project_name, resources, databases_tested),
+        "backendapp/docs.md": templates.docs_md(
+            project_name, resources, databases_tested, features, summary
+        ),
         "backendapp/requirements_map.json": json.dumps(
             [r.model_dump() for r in resources], indent=2
         ),
@@ -231,7 +252,8 @@ def generate_backend(project, user) -> dict:
      harness_dir}
     """
     plan = GenerationPlan(project_id=project.id, resources=_resource_specs(project))
-    artifacts = _build_artifacts(plan, project.name, ["sqlite"])
+    feature_matrix = business.analyse(project, plan.resources)
+    artifacts = _build_artifacts(plan, project.name, ["sqlite"], feature_matrix)
 
     harness_dir = Path(tempfile.mkdtemp(prefix=f"specforge_backend_{project.id}_"))
     for rel, content in artifacts.items():
@@ -259,7 +281,13 @@ def generate_backend(project, user) -> dict:
         outputs=runs,
     )
 
-    docs = templates.docs_md(project.name, plan.resources, result.databases_tested)
+    docs = templates.docs_md(
+        project.name,
+        plan.resources,
+        result.databases_tested,
+        feature_matrix["features"],
+        feature_matrix["summary"],
+    )
     artifacts["backendapp/docs.md"] = docs
     (harness_dir / "backendapp/docs.md").write_text(docs, encoding="utf-8")
 
@@ -269,6 +297,8 @@ def generate_backend(project, user) -> dict:
         "resources": [r.model_dump() for r in result.resources],
         "artifacts": artifacts,
         "tests_passed": result.tests_passed,
+        "features": feature_matrix["features"],
+        "feature_summary": feature_matrix["summary"],
         "test_output": "\n\n".join(
             f"===== {run.database} =====\n{run.output}" for run in runs
         ),

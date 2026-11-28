@@ -33,10 +33,11 @@ class ResourceSpec(BaseModel):
     ordering_fields: list[str] = Field(
         default_factory=lambda: ["name", "created_at", "updated_at"]
     )
+    capabilities: list[str] = Field(default_factory=lambda: ["crud"])
     writable_fields: list[str] = Field(default_factory=lambda: ["name", "description", "attachment"])
     readable_fields: list[str] = Field(
         default_factory=lambda: ["id", "name", "description", "attachment", "attachment_url",
-                                 "created_at", "updated_at"]
+                                 "status", "created_at", "updated_at"]
     )
 
     @field_validator("rid")

@@ -28,6 +28,12 @@ export default function ProjectDetail() {
     queryFn: async () => (await api.get(`/projects/${id}/traceability/`)).data,
     enabled: tab === "traceability",
   });
+  const business = useQuery({
+    queryKey: ["business", id],
+    queryFn: async () => (await api.get(`/projects/${id}/generated-backend/`)).data,
+    enabled: tab === "business",
+    retry: false,
+  });
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["project", id] });
@@ -89,6 +95,7 @@ export default function ProjectDetail() {
       <div className="flex gap-1 mb-4">
         <Tab active={tab === "requirements"} onClick={() => setTab("requirements")}>Requirements</Tab>
         <Tab active={tab === "traceability"} onClick={() => setTab("traceability")}>Traceability</Tab>
+        <Tab active={tab === "business"} onClick={() => setTab("business")}>Business logic</Tab>
       </div>
 
       {tab === "requirements" && (
@@ -125,6 +132,144 @@ export default function ProjectDetail() {
               <li className="text-sm text-slate-400">No requirements yet.</li>
             )}
           </ul>
+        </>
+      )}
+
+      {tab === "business" && (
+        <>
+          {business.isLoading && (
+            <div aria-busy="true" className="space-y-2">
+              {[0, 1, 2].map((i) => (
+                <div key={i} className="h-24 rounded-xl bg-slate-900 border border-slate-800 animate-pulse" />
+              ))}
+            </div>
+          )}
+          {business.isError && (
+            <div className="rounded-xl bg-slate-900 border border-slate-800 p-5">
+              {business.error?.response?.status === 404 ? (
+                <>
+                  <p className="font-semibold">No generated backend yet.</p>
+                  <p className="mt-1 text-sm text-slate-400">
+                    The business logic matrix is written when the backend is generated from the
+                    approved requirements (<span className="font-mono text-xs">POST /api/projects/{id}/generate-backend/</span>).
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="font-semibold text-rose-300">The matrix could not be loaded.</p>
+                  <button
+                    type="button"
+                    onClick={() => business.refetch()}
+                    className="mt-3 rounded-lg border border-slate-700 px-3 py-1.5 text-sm hover:border-slate-500"
+                  >
+                    Try again
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+          {business.data && (
+            <>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+                {[
+                  ["Requirements", business.data.feature_summary?.total ?? 0],
+                  ["Implemented", business.data.feature_summary?.implemented ?? 0],
+                  ["Needs integration config", business.data.feature_summary?.configuration_required ?? 0],
+                  ["Generated tests", business.data.tests_passed ? "passing" : "not passing"],
+                ].map(([label, value]) => (
+                  <div key={label} className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-center">
+                    <p className="text-2xl font-bold tabular-nums">{value}</p>
+                    <p className="text-xs text-slate-400">{label}</p>
+                  </div>
+                ))}
+              </div>
+
+              <p className="text-xs text-slate-400 mb-3 font-mono">
+                Databases tested: {(business.data.databases_tested || []).join(" + ") || "none"}
+              </p>
+
+              <ul className="space-y-3">
+                {(business.data.features || []).length === 0 && (
+                  <li className="rounded-xl bg-slate-900 border border-slate-800 p-4 text-sm text-slate-400">
+                    No approved functional requirement has been turned into a feature yet.
+                  </li>
+                )}
+                {(business.data.features || []).map((feature) => (
+                  <li key={feature.rid} className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-mono text-xs text-indigo-300">
+                        {feature.rid} <span className="text-slate-500">· /api/{feature.resource}/</span>
+                      </span>
+                      <span
+                        className={`rounded px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider border ${
+                          feature.status === "implemented"
+                            ? "border-emerald-600 text-emerald-300"
+                            : "border-amber-600 text-amber-300"
+                        }`}
+                      >
+                        {feature.status === "implemented" ? "implemented" : "integration config required"}
+                      </span>
+                    </div>
+                    <p className="font-semibold mt-1">{feature.title}</p>
+                    <ul className="mt-2 flex flex-wrap gap-1" aria-label="Capabilities">
+                      {(feature.capabilities || []).map((cap) => (
+                        <li key={cap.id}
+                          className="rounded border border-slate-700 px-2 py-0.5 font-mono text-[10px] text-slate-400">
+                          {cap.label}
+                        </li>
+                      ))}
+                    </ul>
+                    {feature.reason && (
+                      <p className="mt-2 rounded border border-amber-700/60 px-2 py-1 text-xs text-amber-200">
+                        {feature.reason}
+                      </p>
+                    )}
+                    <details className="mt-3">
+                      <summary className="cursor-pointer text-xs text-slate-400 hover:text-slate-200">
+                        {(feature.endpoints || []).length} endpoints · {(feature.tests || []).length} tests ·{" "}
+                        {(feature.rules || []).length} rules
+                      </summary>
+                      <div className="mt-2 grid gap-3 sm:grid-cols-2 text-xs">
+                        <div>
+                          <p className="font-mono text-[10px] uppercase tracking-wider text-slate-500">Endpoints</p>
+                          <ul className="mt-1 space-y-0.5 font-mono text-[11px] text-slate-300">
+                            {(feature.endpoints || []).map((endpoint) => (
+                              <li key={endpoint}>{endpoint}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div>
+                          <p className="font-mono text-[10px] uppercase tracking-wider text-slate-500">Tests</p>
+                          <ul className="mt-1 space-y-0.5 font-mono text-[11px] text-slate-300">
+                            {(feature.tests || []).map((name) => (
+                              <li key={name}>{name}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div className="sm:col-span-2">
+                          <p className="font-mono text-[10px] uppercase tracking-wider text-slate-500">Business rules</p>
+                          <ul className="mt-1 list-disc pl-4 text-slate-400">
+                            {(feature.rules || []).map((rule) => (
+                              <li key={rule}>{rule}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div className="sm:col-span-2">
+                          <p className="font-mono text-[10px] uppercase tracking-wider text-slate-500">Services and tables</p>
+                          <p className="mt-1 font-mono text-[11px] text-slate-300">
+                            {(feature.service || []).join(", ")}
+                          </p>
+                          <p className="mt-1 font-mono text-[11px] text-slate-500">
+                            tables: {(feature.tables || []).join(", ")}
+                          </p>
+                        </div>
+                      </div>
+                    </details>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
         </>
       )}
 

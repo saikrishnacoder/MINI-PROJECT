@@ -12,8 +12,8 @@ class GeneratedBackendSerializer(serializers.ModelSerializer):
         model = GeneratedBackend
         fields = [
             "id", "project", "project_name", "status", "resources", "artifacts",
-            "tests_passed", "test_output", "databases_tested", "generated_at",
-            "created_at",
+            "tests_passed", "test_output", "databases_tested", "features",
+            "feature_summary", "generated_at", "created_at",
         ]
         read_only_fields = fields
 

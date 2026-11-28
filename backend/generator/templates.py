@@ -3,8 +3,11 @@
 Every function returns the exact text of one generated file. The app is real,
 runnable Django: JWT auth, role-based permissions, a service layer with
 transactions, a structured error handler, file upload validation, search and
-filtering, pagination, and API docs carrying request/response schemas.
+filtering, pagination, lifecycle workflows, notifications, analytics and API
+docs carrying request/response schemas.
 """
+import json
+
 from .schemas import ResourceSpec
 
 
@@ -51,9 +54,91 @@ class UserProfile(models.Model):
 
     def __str__(self):
         return f"{self.user} ({self.role})"
+
+
+LIFECYCLE_CHOICES = [
+    ("draft", "Draft"),
+    ("active", "Active"),
+    ("archived", "Archived"),
+]
 '''
     models = [_resource_model(r) for r in resources]
-    return header + "\n\n" + "\n\n".join(models)
+    shared = _shared_models()
+    return header + "\n\n" + "\n\n".join(models) + "\n\n" + shared
+
+
+def _shared_models() -> str:
+    return '''class StatusEvent(models.Model):
+    """Audit row for every lifecycle transition of any generated resource."""
+
+    resource = models.CharField(max_length=100)
+    rid = models.CharField(max_length=32)
+    object_id = models.PositiveIntegerField()
+    from_status = models.CharField(max_length=16)
+    to_status = models.CharField(max_length=16)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="status_events"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["resource", "object_id", "-created_at"])]
+
+    def __str__(self):
+        return f"{self.resource}#{self.object_id}: {self.from_status} -> {self.to_status}"
+
+
+class Notification(models.Model):
+    """In-app notification. Only its recipient can read or mark it."""
+
+    class Kind(models.TextChoices):
+        CREATED = "record_created", "Record created"
+        UPDATED = "record_updated", "Record updated"
+        DELETED = "record_deleted", "Record deleted"
+        STATUS = "status_changed", "Status changed"
+
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="notifications"
+    )
+    kind = models.CharField(max_length=32, choices=Kind.choices)
+    resource = models.CharField(max_length=100)
+    rid = models.CharField(max_length=32)
+    object_id = models.PositiveIntegerField(null=True, blank=True)
+    title = models.CharField(max_length=200)
+    message = models.TextField(blank=True)
+    read_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["recipient", "read_at", "-created_at"])]
+
+    def __str__(self):
+        return f"{self.title} -> {self.recipient}"
+
+
+class ProviderEvent(models.Model):
+    """One real answer from a configured external provider. Never written speculatively."""
+
+    provider = models.CharField(max_length=50)
+    action = models.CharField(max_length=50)
+    resource = models.CharField(max_length=100)
+    object_id = models.PositiveIntegerField()
+    http_status = models.PositiveIntegerField(null=True, blank=True)
+    status = models.CharField(max_length=16)
+    detail = models.TextField(blank=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="provider_events"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.provider}:{self.action} {self.status} ({self.http_status})"
+'''
 
 
 def _resource_model(r: ResourceSpec) -> str:
@@ -66,12 +151,13 @@ def _resource_model(r: ResourceSpec) -> str:
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     attachment = models.FileField(upload_to="attachments/%Y/%m/", blank=True, null=True)
+    status = models.CharField(max_length=16, choices=LIFECYCLE_CHOICES, default="draft")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at"]
-        indexes = [models.Index(fields=["owner", "-created_at"])]
+        indexes = [models.Index(fields=["owner", "-created_at"]), models.Index(fields=["status"])]
         constraints = [
             models.UniqueConstraint(
                 fields=["owner", "name"], name="uniq_{r.route}_owner_name"
@@ -215,7 +301,7 @@ def serializers_py(resources: list[ResourceSpec]) -> str:
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Role, UserProfile
+from .models import Role, UserProfile, Notification, StatusEvent
 '''
     imports = "\n".join(f"from .models import {r.class_name}" for r in resources)
     tail = '''
@@ -281,6 +367,34 @@ class RoleAssignSerializer(serializers.Serializer):
     role = serializers.CharField(max_length=50)
 
 
+class TransitionSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=["draft", "active", "archived"])
+
+
+class StatusEventSerializer(serializers.ModelSerializer):
+    actor_username = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StatusEvent
+        fields = ["id", "resource", "rid", "object_id", "from_status", "to_status",
+                  "actor_username", "created_at"]
+
+    def get_actor_username(self, obj):
+        return obj.actor.username if obj.actor_id else None
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    read = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Notification
+        fields = ["id", "kind", "resource", "rid", "object_id", "title", "message",
+                  "read", "read_at", "created_at"]
+
+    def get_read(self, obj):
+        return obj.read_at is not None
+
+
 def issue_tokens(user):
     refresh = RefreshToken.for_user(user)
     return {"refresh": str(refresh), "access": str(refresh.access_token)}
@@ -292,7 +406,9 @@ def issue_tokens(user):
 
 def _resource_serializer(r: ResourceSpec) -> str:
     fields = ", ".join(f'"{f}"' for f in r.readable_fields)
-    read_only = ", ".join(f'"{f}"' for f in ["id", "attachment_url", "created_at", "updated_at"])
+    read_only = ", ".join(
+        f'"{f}"' for f in ["id", "attachment_url", "status", "created_at", "updated_at"]
+    )
     search = ", ".join(r.search_fields)
     return f'''class {r.class_name}Serializer(serializers.ModelSerializer):
     """{r.rid} - {r.title}. Searchable fields: {search}."""
@@ -315,6 +431,7 @@ def _resource_serializer(r: ResourceSpec) -> str:
 
 
 def services_py(resources: list[ResourceSpec]) -> str:
+    models = ", ".join(r.class_name for r in resources)
     header = '''"""Business-logic layer.
 
 Views never touch the ORM directly: every write goes through these functions,
@@ -322,16 +439,32 @@ which hold the transaction boundary and turn domain violations into
 ``ServiceError`` (rendered by the shared exception handler).
 """
 import logging
+from datetime import timedelta
 
 from django.db import IntegrityError, transaction
+from django.db.models import Count, Q
+from django.utils import timezone
 
 from .exceptions import ServiceError
-from .models import ''' + ", ".join(r.class_name for r in resources) + '''
+from .permissions import role_of
+from .models import ''' + models + ''', Notification, ProviderEvent, StatusEvent, UserProfile
 
 logger = logging.getLogger("backendapp.services")
 
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 ALLOWED_ATTACHMENT_SUFFIXES = {".csv", ".jpeg", ".jpg", ".pdf", ".png", ".txt"}
+
+# Lifecycle: draft -> active -> archived, and back. Anything else is rejected.
+STATUS_TRANSITIONS = {
+    "draft": ("active",),
+    "active": ("draft", "archived"),
+    "archived": ("active",),
+}
+
+
+def allowed_transitions(current):
+    """Statuses reachable from ``current``."""
+    return list(STATUS_TRANSITIONS.get(current, ()))
 
 
 def validate_attachment(upload):
@@ -353,12 +486,143 @@ def validate_attachment(upload):
             "Attachments are limited to 5 MB.",
             {"size": size, "max_size": MAX_ATTACHMENT_BYTES},
         )
+
+
+def notify_record(*, instance, resource, rid, kind, title, message=""):
+    """Write one Notification row per recipient: the owner and viewers of everything.
+
+    Recipients are resolved from the database so a role change applies at once.
+    """
+    recipients = {instance.owner_id}
+    recipients.update(
+        UserProfile.objects.filter(role__can_view_all=True).values_list("user_id", flat=True)
+    )
+    rows = [
+        Notification(
+            recipient_id=recipient,
+            kind=kind,
+            resource=resource,
+            rid=rid,
+            object_id=instance.pk,
+            title=title,
+            message=message,
+        )
+        for recipient in sorted(recipients)
+    ]
+    Notification.objects.bulk_create(rows)
+    return len(rows)
+
+
+@transaction.atomic
+def transition_status(*, instance, resource, rid, target_status, actor):
+    """Move a record along the lifecycle and audit the change."""
+    target = (target_status or "").strip().lower()
+    if target not in STATUS_TRANSITIONS:
+        raise ServiceError(
+            "invalid_status",
+            f"Unknown status {target!r}.",
+            {"allowed": sorted(STATUS_TRANSITIONS)},
+        )
+    if target == instance.status:
+        raise ServiceError(
+            "no_status_change", f"Record is already {target}.", {"status": target}
+        )
+    if target not in STATUS_TRANSITIONS[instance.status]:
+        raise ServiceError(
+            "invalid_transition",
+            f"{instance.status} -> {target} is not allowed.",
+            {"from": instance.status, "to": target, "allowed": allowed_transitions(instance.status)},
+        )
+    previous = instance.status
+    instance.status = target
+    instance.save(update_fields=["status", "updated_at"])
+    StatusEvent.objects.create(
+        resource=resource,
+        rid=rid,
+        object_id=instance.pk,
+        from_status=previous,
+        to_status=target,
+        actor=actor,
+    )
+    notify_record(
+        instance=instance,
+        resource=resource,
+        rid=rid,
+        kind=Notification.Kind.STATUS,
+        title=f"{instance.name} moved to {target}",
+        message=f"{previous} -> {target}",
+    )
+    logger.info("transitioned %s id=%s %s->%s", resource, instance.pk, previous, target)
+    return instance
+
+
+def analytics_summary(*, user):
+    """Per-resource counts scoped by the caller's role, from the database."""
+    role = role_of(user)
+    since = timezone.now() - timedelta(days=7)
+    can_view_all = bool(role and role.can_view_all)
+    rows = []
+    totals = {"total": 0, "mine": 0, "created_last_7_days": 0}
+    for model, route, rid in _ANALYTICS_MODELS:
+        visible = model.objects.all() if can_view_all else model.objects.filter(owner_id=user.pk)
+        aggregate = visible.aggregate(
+            total=Count("id"), recent=Count("id", filter=Q(created_at__gte=since))
+        )
+        mine = model.objects.filter(owner_id=user.pk).count()
+        by_status = {
+            row["status"]: row["n"] for row in visible.values("status").annotate(n=Count("id"))
+        }
+        rows.append(
+            {
+                "resource": route,
+                "rid": rid,
+                "total": aggregate["total"],
+                "mine": mine,
+                "created_last_7_days": aggregate["recent"],
+                "by_status": by_status,
+            }
+        )
+        totals["total"] += aggregate["total"]
+        totals["mine"] += mine
+        totals["created_last_7_days"] += aggregate["recent"]
+    return {"generated_at": timezone.now().isoformat(), "totals": totals, "resources": rows}
+
+
+_ANALYTICS_MODELS = [
+''' + "\n".join(
+        f'    ({r.class_name}, "{r.route}", "{r.rid}"),' for r in resources
+    ) + '''
+]
 '''
-    bodies = "\n".join(_resource_services(r) for r in resources)
-    return header + "\n\n" + bodies
+    bodies = _resource_services(resources)
+    payment = ""
+    if any("payments" in r.capabilities for r in resources):
+        payment = '''
+
+def request_checkout(*, instance, resource, rid, actor):
+    """Ask the configured payment provider; nothing is recorded without a real answer.
+
+    Deliberately not atomic: a failure must leave its ProviderEvent row committed.
+    """
+    from . import integrations
+
+    return integrations.request_payment(
+        action="checkout",
+        resource=resource,
+        rid=rid,
+        object_id=instance.pk,
+        payload={"reference": f"{resource}:{instance.pk}", "label": instance.name},
+        actor=actor,
+    )
+'''
+    return header + "\n\n" + bodies + payment
 
 
-def _resource_services(r: ResourceSpec) -> str:
+def _resource_services(resources: list[ResourceSpec]) -> str:
+    return "\n".join(_one_resource_services(r) for r in resources)
+
+
+def _one_resource_services(r: ResourceSpec) -> str:
     return f'''@transaction.atomic
 def create_{r.route}(*, owner, serializer):
     """Create one {r.class_name} for ``owner``; duplicate names are a conflict."""
@@ -374,17 +638,25 @@ def create_{r.route}(*, owner, serializer):
             {{"name": data.get("name")}},
             status_code=409,
         ) from exc
-    logger.info("created %s id=%s owner=%s", "{r.resource}", obj.pk, owner.pk)
+    notify_record(
+        instance=obj,
+        resource="{r.route}",
+        rid="{r.rid}",
+        kind=Notification.Kind.CREATED,
+        title=f"{{obj.name}} created",
+        message="{r.rid} {r.title}",
+    )
+    logger.info("created %s id=%s owner=%s", "{r.route}", obj.pk, owner.pk)
     return obj
 
 
 @transaction.atomic
-def update_{r.route}(*, instance, serializer):
+def update_{r.route}(*, instance, serializer, actor=None):
     """Update one {r.class_name} inside a transaction."""
     validate_attachment(serializer.validated_data.get("attachment"))
     try:
         with transaction.atomic():
-            return serializer.save()
+            obj = serializer.save()
     except IntegrityError as exc:
         raise ServiceError(
             "duplicate_name",
@@ -392,14 +664,34 @@ def update_{r.route}(*, instance, serializer):
             {{"name": serializer.validated_data.get("name")}},
             status_code=409,
         ) from exc
+    notify_record(
+        instance=obj,
+        resource="{r.route}",
+        rid="{r.rid}",
+        kind=Notification.Kind.UPDATED,
+        title=f"{{obj.name}} updated",
+        message=f"Updated by {{getattr(actor, 'username', 'system')}}",
+    )
+    return obj
 
 
 @transaction.atomic
-def delete_{r.route}(*, instance):
+def delete_{r.route}(*, instance, actor=None):
     """Delete one {r.class_name} inside a transaction."""
     pk = instance.pk
+    name = instance.name
+    owner_id = instance.owner_id
     instance.delete()
-    logger.info("deleted %s id=%s", "{r.resource}", pk)
+    Notification.objects.create(
+        recipient_id=owner_id,
+        kind=Notification.Kind.DELETED,
+        resource="{r.route}",
+        rid="{r.rid}",
+        object_id=pk,
+        title=f"{{name}} deleted",
+        message=f"Deleted by {{getattr(actor, 'username', 'system')}}",
+    )
+    logger.info("deleted %s id=%s", "{r.route}", pk)
 '''
 
 
@@ -563,8 +855,22 @@ class StandardPagination(PageNumberPagination):
 
 
 def filters_py() -> str:
-    return '''from django.utils.dateparse import parse_date
+    return '''from datetime import datetime, time
+
+from django.utils import timezone
+from django.utils.dateparse import parse_date
 from rest_framework import filters
+from rest_framework.exceptions import ValidationError
+
+STATUS_VALUES = ("draft", "active", "archived")
+
+
+def _start_of_day(day):
+    return timezone.make_aware(datetime.combine(day, time.min), timezone.get_current_timezone())
+
+
+def _end_of_day(day):
+    return timezone.make_aware(datetime.combine(day, time.max), timezone.get_current_timezone())
 
 
 class DateRangeFilter(filters.BaseFilterBackend):
@@ -575,13 +881,27 @@ class DateRangeFilter(filters.BaseFilterBackend):
         before = request.query_params.get("created_before")
         if after:
             parsed = parse_date(after)
-            if parsed:
-                queryset = queryset.filter(created_at__date__gte=parsed)
+            if parsed is None:
+                raise ValidationError({"created_after": "Expected an ISO date, e.g. 2026-01-31."})
+            queryset = queryset.filter(created_at__gte=_start_of_day(parsed))
         if before:
             parsed = parse_date(before)
-            if parsed:
-                queryset = queryset.filter(created_at__date__lte=parsed)
+            if parsed is None:
+                raise ValidationError({"created_before": "Expected an ISO date, e.g. 2026-01-31."})
+            queryset = queryset.filter(created_at__lte=_end_of_day(parsed))
         return queryset
+
+
+class StatusFilter(filters.BaseFilterBackend):
+    """``?status=draft|active|archived`` for the record lifecycle."""
+
+    def filter_queryset(self, request, queryset, view):
+        value = request.query_params.get("status")
+        if not value:
+            return queryset
+        if value not in STATUS_VALUES:
+            raise ValidationError({"status": f"Choose one of {', '.join(STATUS_VALUES)}."})
+        return queryset.filter(status=value)
 '''
 
 
@@ -708,13 +1028,22 @@ class UserViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.Gen
 
 def views_py(resources: list[ResourceSpec]) -> str:
     header = '''from rest_framework import parsers, permissions, viewsets
+from rest_framework.decorators import action
 from rest_framework.filters import OrderingFilter, SearchFilter
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from . import services
-from .filters import DateRangeFilter
-from .models import ''' + ", ".join(r.class_name for r in resources) + '''
+from .features import FEATURES, SUMMARY
+from .filters import DateRangeFilter, StatusFilter
+from .integrations import describe_integrations
+from .models import ''' + ", ".join(r.class_name for r in resources) + ''', Notification, StatusEvent
 from .permissions import IsOwnerOrRole, role_of
-from .serializers import ''' + ", ".join(f"{r.class_name}Serializer" for r in resources) + '''
+from .serializers import (
+''' + "".join(f"    {r.class_name}Serializer,\n" for r in resources) + '''    NotificationSerializer,
+    StatusEventSerializer,
+    TransitionSerializer,
+)
 
 
 def _visible_to(user, queryset):
@@ -723,25 +1052,156 @@ def _visible_to(user, queryset):
     if role and role.can_view_all:
         return queryset
     return queryset.filter(owner=user)
+
+
+class AnalyticsSummaryView(APIView):
+    """GET /api/analytics/summary/ - live counts scoped to the caller's role."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        return Response(services.analytics_summary(user=request.user))
 '''
     views = "\n\n".join(_resource_view(r) for r in resources)
-    return header + "\n\n" + views
+    ops = '''
+
+class NotificationListView(APIView):
+    """GET /api/notifications/ - the caller's inbox, newest first (``?unread=true``)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        queryset = Notification.objects.filter(recipient=request.user)
+        if request.query_params.get("unread") in {"1", "true", "yes"}:
+            queryset = queryset.filter(read_at__isnull=True)
+        return Response(NotificationSerializer(queryset[:100], many=True).data)
+
+
+class UnreadCountView(APIView):
+    """GET /api/notifications/unread_count/ - ``{"unread": n}`` for the caller."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        count = Notification.objects.filter(
+            recipient=request.user, read_at__isnull=True
+        ).count()
+        return Response({"unread": count})
+
+
+class MarkReadView(APIView):
+    """POST /api/notifications/{id}/read/ - only the recipient may mark a row."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        notification = Notification.objects.filter(recipient=request.user, pk=pk).first()
+        if notification is None:
+            return Response(
+                {"error": {"code": "not_found", "message": "No such notification.",
+                           "details": {}, "request_id": getattr(request, "request_id", "")}},
+                status=404,
+            )
+        if notification.read_at is None:
+            from django.utils import timezone
+
+            notification.read_at = timezone.now()
+            notification.save(update_fields=["read_at"])
+        return Response(NotificationSerializer(notification).data)
+
+
+class MarkAllReadView(APIView):
+    """POST /api/notifications/read_all/ - mark every unread row of the caller."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        from django.utils import timezone
+
+        marked = Notification.objects.filter(
+            recipient=request.user, read_at__isnull=True
+        ).update(read_at=timezone.now())
+        return Response({"marked": marked})
+
+
+class IntegrationStatusView(APIView):
+    """GET /api/integrations/ - which external integrations are configured.
+
+    Required environment variable names are listed; their values never leave the server.
+    Unconfigured integrations are reported as such - nothing is simulated.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        return Response({"integrations": describe_integrations()})
+
+
+class FeaturesView(APIView):
+    """GET /api/features/ - requirement -> capability -> code -> test traceability."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        return Response({"summary": SUMMARY, "features": FEATURES})
+'''
+    return header + "\n\n" + views + ops
 
 
 def _resource_view(r: ResourceSpec) -> str:
     search = ", ".join(f'"{f}"' for f in r.search_fields)
     ordering = ", ".join(f'"{f}"' for f in r.ordering_fields)
+    actions = f'''
+
+    @action(detail=True, methods=["post"], url_path="transition")
+    def transition(self, request, pk=None):
+        """Move the record along the lifecycle (draft -> active -> archived)."""
+        instance = self.get_object()
+        serializer = TransitionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        updated = services.transition_status(
+            instance=instance,
+            resource="{r.route}",
+            rid="{r.rid}",
+            target_status=serializer.validated_data["status"],
+            actor=request.user,
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["get"], url_path="history")
+    def history(self, request, pk=None):
+        """Every lifecycle transition of this record, newest first."""
+        instance = self.get_object()
+        events = StatusEvent.objects.filter(
+            resource="{r.route}", object_id=instance.pk
+        ).select_related("actor")
+        return Response(StatusEventSerializer(events, many=True).data)
+'''
+    if "payments" in r.capabilities:
+        actions += f'''
+    @action(detail=True, methods=["post"], url_path="checkout")
+    def checkout(self, request, pk=None):
+        """Ask the configured payment provider. 503 while it is unconfigured."""
+        instance = self.get_object()
+        result = services.request_checkout(
+            instance=instance, resource="{r.route}", rid="{r.rid}", actor=request.user
+        )
+        return Response(
+            {{"record": self.get_serializer(instance).data, "provider": result["provider"],
+              "provider_status": result["provider_status"], "payload": result["payload"]}}
+        )
+'''
     return f'''class {r.class_name}ViewSet(viewsets.ModelViewSet):
     """CRUD for {r.class_name} ({r.rid}: {r.title}).
 
     Search with ``?search=``, order with ``?ordering=``, filter with
-    ``?created_after=`` / ``?created_before=``, paginate with ``?page=``.
+    ``?created_after=`` / ``?created_before=`` / ``?status=``, paginate with ``?page=``.
     """
 
     serializer_class = {r.class_name}Serializer
     permission_classes = [permissions.IsAuthenticated, IsOwnerOrRole]
     parser_classes = [parsers.JSONParser, parsers.MultiPartParser, parsers.FormParser]
-    filter_backends = [SearchFilter, OrderingFilter, DateRangeFilter]
+    filter_backends = [SearchFilter, OrderingFilter, DateRangeFilter, StatusFilter]
     search_fields = [{search}]
     ordering_fields = [{ordering}]
     ordering = ["-created_at"]
@@ -754,15 +1214,28 @@ def _resource_view(r: ResourceSpec) -> str:
         services.create_{r.route}(owner=self.request.user, serializer=serializer)
 
     def perform_update(self, serializer):
-        services.update_{r.route}(instance=serializer.instance, serializer=serializer)
+        services.update_{r.route}(
+            instance=serializer.instance, serializer=serializer, actor=self.request.user
+        )
 
     def perform_destroy(self, instance):
-        services.delete_{r.route}(instance=instance)
-'''
+        services.delete_{r.route}(instance=instance, actor=self.request.user)
+{actions}'''
 
 
 def urls_py(resources: list[ResourceSpec]) -> str:
     imports = "\n".join(f"from .views import {r.class_name}ViewSet" for r in resources)
+    operational = (
+        "from .views import (\n"
+        "    AnalyticsSummaryView,\n"
+        "    FeaturesView,\n"
+        "    IntegrationStatusView,\n"
+        "    MarkAllReadView,\n"
+        "    MarkReadView,\n"
+        "    NotificationListView,\n"
+        "    UnreadCountView,\n"
+        ")\n"
+    )
     registrations = "\n".join(
         f'router.register(r"{r.route}", {r.class_name}ViewSet, basename="{r.route}")'
         for r in resources
@@ -775,7 +1248,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from .auth_views import LoginView, LogoutView, MeView, RegisterView, UserViewSet
 {imports}
-
+{operational}
 router = DefaultRouter()
 {registrations}
 router.register(r"users", UserViewSet, basename="user")
@@ -786,6 +1259,13 @@ urlpatterns = [
     path("api/auth/token/refresh/", TokenRefreshView.as_view(), name="auth-token-refresh"),
     path("api/auth/logout/", LogoutView.as_view(), name="auth-logout"),
     path("api/auth/me/", MeView.as_view(), name="auth-me"),
+    path("api/analytics/summary/", AnalyticsSummaryView.as_view(), name="analytics-summary"),
+    path("api/notifications/", NotificationListView.as_view(), name="notification-list"),
+    path("api/notifications/unread_count/", UnreadCountView.as_view(), name="notification-unread"),
+    path("api/notifications/read_all/", MarkAllReadView.as_view(), name="notification-read-all"),
+    path("api/notifications/<int:pk>/read/", MarkReadView.as_view(), name="notification-read"),
+    path("api/integrations/", IntegrationStatusView.as_view(), name="integration-status"),
+    path("api/features/", FeaturesView.as_view(), name="feature-matrix"),
     path("api/", include(router.urls)),
 ]
 
@@ -972,6 +1452,138 @@ pydantic>=2.6
 '''
 
 
+def integrations_py() -> str:
+    return '''"""External integration configuration.
+
+Every value is read from the environment. Nothing is simulated: an
+unconfigured integration raises 503 ``integration_not_configured`` before a
+single request is made, and ``ProviderEvent`` is written only from a real
+provider answer.
+"""
+import json
+import os
+import urllib.error
+import urllib.request
+
+from .exceptions import ServiceError
+from .models import ProviderEvent
+
+INTEGRATIONS = {
+    "payments": {
+        "label": "Payment provider",
+        "url_env": "PAYMENT_PROVIDER_URL",
+        "key_env": "PAYMENT_API_KEY",
+    },
+    "external_api": {
+        "label": "External API",
+        "url_env": "EXTERNAL_API_URL",
+        "key_env": "EXTERNAL_API_KEY",
+    },
+}
+
+
+def describe_integrations():
+    """Configured flag and required variable names per integration (never values)."""
+    rows = []
+    for name, config in INTEGRATIONS.items():
+        required = [config["url_env"], config["key_env"]]
+        missing = [env for env in required if not os.environ.get(env, "").strip()]
+        rows.append(
+            {
+                "name": name,
+                "label": config["label"],
+                "configured": not missing,
+                "env": required,
+                "missing": missing,
+            }
+        )
+    return rows
+
+
+def request_payment(*, action, resource, rid, object_id, payload, actor):
+    """POST to the configured payment provider and record its real answer."""
+    config = INTEGRATIONS["payments"]
+    url = os.environ.get(config["url_env"], "").strip()
+    key = os.environ.get(config["key_env"], "").strip()
+    if not url or not key:
+        raise ServiceError(
+            "integration_not_configured",
+            "Payments are not configured; no payment was attempted.",
+            {"integration": "payments", "env": [config["url_env"], config["key_env"]]},
+            status_code=503,
+        )
+    body = json.dumps(
+        {"action": action, "resource": resource, "rid": rid, "object_id": object_id, **payload}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            http_status = response.status
+            raw = response.read() or b"{}"
+    except urllib.error.HTTPError as exc:
+        detail = (exc.read() or b"")[:500].decode("utf-8", "replace")
+        ProviderEvent.objects.create(
+            provider="payments", action=action, resource=resource, object_id=object_id,
+            http_status=exc.code, status="failed", detail=detail, actor=actor,
+        )
+        raise ServiceError(
+            "provider_error",
+            f"The payment provider answered {exc.code}; nothing was charged.",
+            {"http_status": exc.code},
+            status_code=502,
+        ) from exc
+    except urllib.error.URLError as exc:
+        ProviderEvent.objects.create(
+            provider="payments", action=action, resource=resource, object_id=object_id,
+            http_status=None, status="failed", detail=str(exc.reason)[:500], actor=actor,
+        )
+        raise ServiceError(
+            "provider_unreachable",
+            "The payment provider could not be reached; nothing was charged.",
+            {"reason": str(exc.reason)},
+            status_code=502,
+        ) from exc
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (ValueError, AttributeError):
+        parsed = {"raw": str(raw)[:500]}
+    succeeded = 200 <= http_status < 300
+    ProviderEvent.objects.create(
+        provider="payments", action=action, resource=resource, object_id=object_id,
+        http_status=http_status, status="succeeded" if succeeded else "failed",
+        detail=json.dumps(parsed)[:500], actor=actor,
+    )
+    if not succeeded:
+        raise ServiceError(
+            "provider_error",
+            f"The payment provider answered {http_status}; nothing was charged.",
+            {"http_status": http_status},
+            status_code=502,
+        )
+    return {"provider": "payments", "provider_status": http_status, "payload": parsed}
+'''
+
+
+def features_py(features: list[dict], summary: dict) -> str:
+    return f'''"""Generated business-logic matrix (Phase 8).
+
+Each entry maps one approved functional requirement to the capabilities that
+back it, the service functions and tables it writes, and the tests that cover
+it. ``status`` is ``implemented`` or ``configuration_required`` (with a written
+reason) - no requirement is listed without one of the two.
+"""
+import json
+
+FEATURES = json.loads({json.dumps(json.dumps(features))})
+SUMMARY = json.loads({json.dumps(json.dumps(summary))})
+'''
+
+
 def env_example() -> str:
     # The MySQL password is deliberately absent: it is read from the
     # environment (or the Vault) and must never be committed.
@@ -990,6 +1602,13 @@ MYSQL_DATABASE=generated_app
 MYSQL_USER=root
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
+
+# External integrations. Leave empty to keep them disabled: calls then return
+# 503 integration_not_configured and no transaction is simulated.
+# PAYMENT_PROVIDER_URL=
+# PAYMENT_API_KEY=
+# EXTERNAL_API_URL=
+# EXTERNAL_API_KEY=
 '''
 
 
@@ -997,18 +1616,28 @@ def tests_py(resources: list[ResourceSpec]) -> str:
     blocks = [_resource_tests(r) for r in resources]
     blocks.append(_auth_tests())
     blocks.append(_role_tests(resources[0]))
+    blocks.append(_analytics_tests(resources))
+    blocks.append(_feature_matrix_tests(resources))
+    blocks.append(_integration_status_tests())
+    for r in resources:
+        if "payments" in r.capabilities:
+            blocks.append(_payment_tests(r))
     return test_header(resources) + "\n\n" + "\n\n".join(blocks)
 
 
 def test_header(resources: list[ResourceSpec]) -> str:
     imports = "\n".join(f"from .models import {r.class_name}" for r in resources)
-    return f'''from django.contrib.auth import get_user_model
+    return f'''import os
+import urllib.error
+from unittest import mock
+
+from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.urls import reverse
 from rest_framework import test
 
-from .models import Role, UserProfile
+from .models import Notification, ProviderEvent, Role, StatusEvent, UserProfile
 {imports}
 from .roles import ensure_default_roles
 '''
@@ -1105,6 +1734,87 @@ class {r.class_name}APITests(test.APITestCase):
     def test_response_carries_request_id(self):
         res = self.client.get(self.list_url, HTTP_X_REQUEST_ID="trace-123")
         self.assertEqual(res["X-Request-ID"], "trace-123")
+
+    def test_status_transitions_follow_the_workflow(self):
+        self._create(name="Workflow record")
+        obj = {r.class_name}.objects.get()
+        url = reverse("{r.route}-transition", args=[obj.pk])
+
+        res = self.client.post(url, {{"status": "archived"}}, format="json")
+        self.assertEqual(res.status_code, 400, res.data)
+        self.assertEqual(res.data["error"]["code"], "invalid_transition")
+        self.assertEqual(res.data["error"]["details"]["allowed"], ["active"])
+
+        res = self.client.post(url, {{"status": "active"}}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        obj.refresh_from_db()
+        self.assertEqual(obj.status, "active")
+
+        res = self.client.post(url, {{"status": "nonsense"}}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data["error"]["code"], "validation_error")
+        self.assertEqual(
+            StatusEvent.objects.filter(resource="{r.route}", object_id=obj.pk).count(), 1
+        )
+
+    def test_history_records_every_transition(self):
+        self._create(name="History record")
+        obj = {r.class_name}.objects.get()
+        url = reverse("{r.route}-transition", args=[obj.pk])
+        self.assertEqual(
+            self.client.post(url, {{"status": "active"}}, format="json").status_code, 200
+        )
+        self.assertEqual(
+            self.client.post(url, {{"status": "draft"}}, format="json").status_code, 200
+        )
+        res = self.client.get(reverse("{r.route}-history", args=[obj.pk]))
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(len(res.data), 2)
+        self.assertEqual(res.data[0]["from_status"], "active")
+        self.assertEqual(res.data[0]["to_status"], "draft")
+        self.assertEqual(res.data[0]["actor_username"], self.user.username)
+
+    def test_date_range_and_status_filter(self):
+        self.assertEqual(self._create(name="Filtered").status_code, 201)
+        res = self.client.get(self.list_url, {{"created_after": "2999-01-01"}})
+        self.assertEqual(res.data["count"], 0)
+        res = self.client.get(self.list_url, {{"created_before": "2999-01-01"}})
+        self.assertEqual(res.data["count"], 1)
+        res = self.client.get(self.list_url, {{"status": "draft"}})
+        self.assertEqual(res.data["count"], 1)
+        res = self.client.get(self.list_url, {{"status": "archived"}})
+        self.assertEqual(res.data["count"], 0)
+        res = self.client.get(self.list_url, {{"status": "nonsense"}})
+        self.assertEqual(res.status_code, 400)
+
+    def test_owner_is_notified_on_create(self):
+        self.assertEqual(self._create(name="Notify me").status_code, 201)
+        notifications = Notification.objects.filter(recipient=self.user)
+        self.assertEqual(notifications.count(), 1)
+        self.assertEqual(notifications.first().kind, "record_created")
+        self.assertEqual(notifications.first().rid, "{r.rid}")
+
+    def test_notifications_are_private_to_the_recipient(self):
+        self.assertEqual(self._create(name="Private").status_code, 201)
+        other = get_user_model().objects.create_user(
+            username="outsider_{r.route}", email="outsider@example.com", password="strong-pass-123"
+        )
+        notification = Notification.objects.get(recipient=self.user)
+        self.client.force_authenticate(other)
+        self.assertEqual(self.client.get("/api/notifications/").data, [])
+        self.assertEqual(self.client.get("/api/notifications/unread_count/").data["unread"], 0)
+        self.assertEqual(
+            self.client.post(f"/api/notifications/{{notification.pk}}/read/").status_code, 404
+        )
+
+        self.client.force_authenticate(self.user)
+        self.assertEqual(self.client.get("/api/notifications/unread_count/").data["unread"], 1)
+        res = self.client.post(f"/api/notifications/{{notification.pk}}/read/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertTrue(res.data["read"])
+        self.assertEqual(self.client.get("/api/notifications/unread_count/").data["unread"], 0)
+        res = self.client.post("/api/notifications/read_all/")
+        self.assertEqual(res.status_code, 200)
 '''
 
 
@@ -1230,7 +1940,151 @@ class RoleBasedAccessTests(test.APITestCase):
 '''
 
 
-def docs_md(project_name: str, resources: list[ResourceSpec], databases_tested: list[str]) -> str:
+def _analytics_tests(resources: list[ResourceSpec]) -> str:
+    creates = "\n".join(
+        f'        {r.class_name}.objects.create(owner=self.user, name="{r.class_name} row")'
+        for r in resources
+    )
+    checks = "\n".join(
+        f'        self.assertEqual(by_resource["{r.route}"]["total"], '
+        f'{r.class_name}.objects.filter(owner=self.user).count())'
+        for r in resources
+    )
+    routes = ", ".join(f'"{r.route}"' for r in resources)
+    return f'''@override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
+class AnalyticsSummaryTests(test.APITestCase):
+    """Dashboard analytics are aggregates of the real rows, not placeholders."""
+
+    def setUp(self):
+        ensure_default_roles()
+        self.user = get_user_model().objects.create_user(
+            username="analytics_user", email="analytics@example.com", password="strong-pass-123"
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_analytics_summary_matches_database(self):
+{creates}
+        res = self.client.get("/api/analytics/summary/")
+        self.assertEqual(res.status_code, 200, res.data)
+        by_resource = {{row["resource"]: row for row in res.data["resources"]}}
+        self.assertEqual(sorted(by_resource), sorted([{routes}]))
+{checks}
+        self.assertEqual(res.data["totals"]["mine"], len(by_resource))
+        self.assertEqual(res.data["totals"]["total"], len(by_resource))
+        first = by_resource["{resources[0].route}"]
+        self.assertEqual(first["by_status"]["draft"], 1)
+        self.assertEqual(first["created_last_7_days"], 1)
+'''
+
+
+def _feature_matrix_tests(resources: list[ResourceSpec]) -> str:
+    rids = ", ".join(f'"{r.rid}"' for r in resources)
+    return f'''class FeatureMatrixTests(test.APITestCase):
+    """Every approved requirement is traceable to code and tests, or says why not."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="feature_user", email="features@example.com", password="strong-pass-123"
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_features_endpoint_covers_every_requirement(self):
+        res = self.client.get("/api/features/")
+        self.assertEqual(res.status_code, 200, res.data)
+        features = res.data["features"]
+        self.assertEqual(sorted(feature["rid"] for feature in features), sorted([{rids}]))
+        for feature in features:
+            self.assertIn(feature["status"], ("implemented", "configuration_required"))
+            self.assertTrue(feature["endpoints"])
+            self.assertTrue(feature["tests"])
+            self.assertTrue(feature["service"])
+            if feature["status"] == "configuration_required":
+                self.assertTrue(feature["reason"])
+        self.assertEqual(res.data["summary"]["total"], len(features))
+'''
+
+
+def _integration_status_tests() -> str:
+    return '''class IntegrationConfigurationTests(test.APITestCase):
+    """Unconfigured integrations are reported, never simulated as working."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="integration_user", email="integrations@example.com", password="strong-pass-123"
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_integration_status_lists_required_environment(self):
+        res = self.client.get("/api/integrations/")
+        self.assertEqual(res.status_code, 200, res.data)
+        rows = {row["name"]: row for row in res.data["integrations"]}
+        self.assertIn("payments", rows)
+        self.assertIn("external_api", rows)
+        for row in rows.values():
+            self.assertIn("configured", row)
+            self.assertTrue(row["env"])
+            self.assertNotIn("value", row)
+        self.assertEqual(rows["payments"]["env"], ["PAYMENT_PROVIDER_URL", "PAYMENT_API_KEY"])
+        self.assertEqual(rows["external_api"]["env"], ["EXTERNAL_API_URL", "EXTERNAL_API_KEY"])
+'''
+
+
+def _payment_tests(r: ResourceSpec) -> str:
+    return f'''@override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
+class PaymentCheckoutTests(test.APITestCase):
+    """{r.rid}: checkout is a real provider call, never a simulated success."""
+
+    def setUp(self):
+        ensure_default_roles()
+        self.user = get_user_model().objects.create_user(
+            username="payer_{r.route}", email="payer@example.com", password="strong-pass-123"
+        )
+        self.client.force_authenticate(self.user)
+        self.record = {r.class_name}.objects.create(owner=self.user, name="Payable")
+        self.url = reverse("{r.route}-checkout", args=[self.record.pk])
+
+    def test_checkout_without_configuration_is_503(self):
+        environment = {{
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("PAYMENT_PROVIDER_URL", "PAYMENT_API_KEY")
+        }}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            res = self.client.post(self.url, {{}}, format="json")
+        self.assertEqual(res.status_code, 503, res.data)
+        self.assertEqual(res.data["error"]["code"], "integration_not_configured")
+        self.assertEqual(res.data["error"]["details"]["integration"], "payments")
+        self.assertEqual(ProviderEvent.objects.count(), 0)
+
+    def test_checkout_provider_failure_is_recorded(self):
+        environment = {{
+            "PAYMENT_PROVIDER_URL": "https://payments.invalid/checkout",
+            "PAYMENT_API_KEY": "test-key",
+        }}
+        with mock.patch.dict(os.environ, environment):
+            with mock.patch(
+                "backendapp.integrations.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("provider down"),
+            ):
+                res = self.client.post(self.url, {{}}, format="json")
+        self.assertEqual(res.status_code, 502, res.data)
+        self.assertEqual(res.data["error"]["code"], "provider_unreachable")
+        self.assertEqual(ProviderEvent.objects.filter(status="succeeded").count(), 0)
+        event = ProviderEvent.objects.get()
+        self.assertEqual(event.status, "failed")
+        self.assertEqual(event.object_id, self.record.pk)
+'''
+
+
+def docs_md(
+    project_name: str,
+    resources: list[ResourceSpec],
+    databases_tested: list[str],
+    features: list[dict] | None = None,
+    summary: dict | None = None,
+) -> str:
+    features = features or []
+    summary = summary or {}
     lines = [
         f"# {project_name} - Generated Backend API",
         "",
@@ -1260,6 +2114,18 @@ def docs_md(project_name: str, resources: list[ResourceSpec], databases_tested: 
         "| GET | `/api/users/` | JWT | role.can_manage_users | 200 | 401, 403 permission_denied |",
         "| GET | `/api/users/{id}/` | JWT | role.can_manage_users | 200 | 401, 403, 404 |",
         "| PATCH | `/api/users/{id}/role/` | JWT | role.can_manage_users | 200 | 400 unknown_role, 401, 403, 404 |",
+        "",
+        "### Operational endpoints",
+        "",
+        "| Method | Path | Auth | Success | Errors |",
+        "| --- | --- | --- | --- | --- |",
+        "| GET | `/api/analytics/summary/` | JWT | 200 aggregate counts | 401 |",
+        "| GET | `/api/notifications/` | JWT | 200 own inbox (`?unread=true`) | 401 |",
+        "| GET | `/api/notifications/unread_count/` | JWT | 200 `{\"unread\": n}` | 401 |",
+        "| POST | `/api/notifications/{id}/read/` | JWT | 200 marked row | 401, 404 |",
+        "| POST | `/api/notifications/read_all/` | JWT | 200 `{\"marked\": n}` | 401 |",
+        "| GET | `/api/integrations/` | JWT | 200 configured flags + env names | 401 |",
+        "| GET | `/api/features/` | JWT | 200 requirement -> code -> test matrix | 401 |",
         "",
         "### Register",
         "",
@@ -1347,6 +2213,10 @@ def docs_md(project_name: str, resources: list[ResourceSpec], databases_tested: 
         "| 400 | `invalid_credentials` | wrong username/password (401) |",
         "| 400 | `duplicate_name` | same name for the same owner (409) |",
         "| 400 | `unknown_role`, `self_lockout` | role assignment rejected |",
+        "| 400 | `invalid_transition` | lifecycle move not allowed from the current status |",
+        "| 400 | `invalid_status`, `no_status_change` | unknown or unchanged target status |",
+        "| 502 | `provider_error`, `provider_unreachable` | configured payment provider failed; nothing charged |",
+        "| 503 | `integration_not_configured` | integration credentials missing; nothing was attempted |",
         "| 401 | `not_authenticated` | missing/expired JWT |",
         "| 403 | `permission_denied` | authenticated but not allowed |",
         "| 404 | `not_found` | unknown id or not visible to the caller |",
@@ -1361,6 +2231,7 @@ def docs_md(project_name: str, resources: list[ResourceSpec], databases_tested: 
         "| `search` | all list endpoints | case-insensitive match on name/description |",
         "| `ordering` | all list endpoints | `name`, `created_at`, `updated_at`; prefix `-` to reverse |",
         "| `created_after`, `created_before` | all list endpoints | `YYYY-MM-DD` |",
+        "| `status` | all list endpoints | `draft`, `active` or `archived` |",
         "",
         "List response:",
         "",
@@ -1389,10 +2260,14 @@ def docs_md(project_name: str, resources: list[ResourceSpec], databases_tested: 
         f"This build was verified by running the generated test suite on: "
         f"**{', '.join(databases_tested) or 'sqlite'}**.",
         "",
-        "## Endpoints per requirement",
+        "## Business logic per requirement",
         "",
     ]
 
+    if features:
+        lines.extend(_docs_business_logic(features, summary))
+
+    lines.extend(["## Endpoints per requirement", ""])
     for r in resources:
         lines.extend(_docs_resource(r))
 
@@ -1412,24 +2287,94 @@ def docs_md(project_name: str, resources: list[ResourceSpec], databases_tested: 
         "",
         "## Requirement traceability",
         "",
-        "| Requirement | Resource | Base path | Endpoints | Permission |",
-        "| --- | --- | --- | --- | --- |",
+        "| Requirement | Resource | Base path | Status | Endpoints | Permission |",
+        "| --- | --- | --- | --- | --- | --- |",
     ])
+    status_by_rid = {feature["rid"]: feature["status"] for feature in features}
     for r in resources:
         lines.append(
             f"| {r.rid} - {r.title} | `{r.resource}` | `/api/{r.route}/` | "
+            f"{status_by_rid.get(r.rid, 'implemented')} | "
             f"{', '.join(r.endpoints)} | {r.permission} |"
         )
     lines.append("")
     return "\n".join(lines)
 
 
+def _docs_business_logic(features: list[dict], summary: dict) -> list[str]:
+    lines: list[str] = [
+        f"{summary.get('total', len(features))} approved requirement(s): "
+        f"{summary.get('implemented', 0)} fully implemented, "
+        f"{summary.get('configuration_required', 0)} implemented with an integration "
+        "configuration required. Every requirement below has running code and generated "
+        "tests (`backendapp/tests.py`).",
+        "",
+    ]
+    for feature in features:
+        lines.extend(
+            [
+                f"### {feature['rid']} - {feature['title']}",
+                "",
+                f"Status: **{feature['status']}**. Capabilities: "
+                f"{', '.join(feature['capability_labels']) or 'CRUD'}.",
+                "",
+                f"- Service: {', '.join(f'`{name}`' for name in feature['service'])}",
+                f"- Tables: {', '.join(f'`{name}`' for name in feature['tables'])}",
+                f"- Frontend: {', '.join(feature['frontend'])}",
+                f"- Tests: {', '.join(f'`{name}`' for name in feature['tests'])}",
+                "",
+                "Business rules:",
+                "",
+            ]
+        )
+        lines.extend(f"- {rule}" for rule in feature["rules"])
+        lines.append("")
+        lines.append("Validation:")
+        lines.append("")
+        lines.extend(f"- {rule}" for rule in feature["validations"])
+        lines.append("")
+        if feature["reason"]:
+            lines.extend([f"Documented gap: {feature['reason']}", ""])
+    lines.extend(
+        [
+            "## External integrations",
+            "",
+            "Integrations are configuration, never simulated. Required environment "
+            "variables (values are never returned by the API):",
+            "",
+            "| Integration | Environment variables | Behaviour while unconfigured |",
+            "| --- | --- | --- |",
+            "| payments | `PAYMENT_PROVIDER_URL`, `PAYMENT_API_KEY` | `503 "
+            "integration_not_configured`, no `ProviderEvent` written |",
+            "| external_api | `EXTERNAL_API_URL`, `EXTERNAL_API_KEY` | reported as "
+            "unconfigured by `GET /api/integrations/` |",
+            "",
+            "`GET /api/integrations/` lists each integration with `configured`, the "
+            "required variable names and the missing ones. A `ProviderEvent` row is only "
+            "written after a real provider answer; an unreachable provider is `502` and is "
+            "recorded as `failed`.",
+            "",
+        ]
+    )
+    return lines
+
+
 def _docs_resource(r: ResourceSpec) -> list[str]:
+    extra_rows = []
+    if "workflow" in r.capabilities:
+        extra_rows += [
+            f"| POST | `/api/{r.route}/{{id}}/transition/` | JWT | owner, can_edit_others | 200 | 400 invalid_transition, 401, 403, 404 |",
+            f"| GET | `/api/{r.route}/{{id}}/history/` | JWT | owner, can_view_all | 200 | 401, 403, 404 |",
+        ]
+    if "payments" in r.capabilities:
+        extra_rows.append(
+            f"| POST | `/api/{r.route}/{{id}}/checkout/` | JWT | owner, can_edit_others | 200 | 401, 403, 404, 502, 503 integration_not_configured |"
+        )
     return [
         f"### {r.rid} - {r.title}",
         "",
         f"Resource `{r.resource}`, base path `/api/{r.route}/`, model `{r.class_name}`, "
-        f"permission `{r.permission}`.",
+        f"permission `{r.permission}`. Capabilities: {', '.join(r.capabilities)}.",
         "",
         "| Method | Path | Auth | Permission | Success | Errors |",
         "| --- | --- | --- | --- | --- | --- |",
@@ -1439,6 +2384,7 @@ def _docs_resource(r: ResourceSpec) -> list[str]:
         f"| PATCH | `/api/{r.route}/{{id}}/` | JWT | owner, can_edit_others | 200 | 400, 401, 403, 404, 409 |",
         f"| PUT | `/api/{r.route}/{{id}}/` | JWT | owner, can_edit_others | 200 | 400, 401, 403, 404 |",
         f"| DELETE | `/api/{r.route}/{{id}}/` | JWT | owner, can_edit_others | 204 | 401, 403, 404 |",
+        *extra_rows,
         "",
         "Request body (`POST` JSON or multipart; `PATCH` accepts a subset):",
         "",
@@ -1447,6 +2393,9 @@ def _docs_resource(r: ResourceSpec) -> list[str]:
         "| `name` | string | yes | max 200, unique per owner |",
         "| `description` | string | no | free text |",
         "| `attachment` | file | no | pdf/png/jpg/jpeg/txt/csv, max 5 MB |",
+        "",
+        "`status` is read-only: change it with the transition endpoint "
+        "(`draft` -> `active` -> `archived`, and back).",
         "",
         "Response `201`:",
         "",
@@ -1457,6 +2406,7 @@ def _docs_resource(r: ResourceSpec) -> list[str]:
         '  "description": "d",',
         '  "attachment": null,',
         '  "attachment_url": null,',
+        '  "status": "draft",',
         '  "created_at": "2026-01-01T10:00:00Z",',
         '  "updated_at": "2026-01-01T10:00:00Z"',
         "}",

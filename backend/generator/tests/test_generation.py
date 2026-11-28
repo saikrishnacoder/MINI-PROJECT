@@ -74,10 +74,18 @@ def test_generation_produces_runnable_backend_and_trace_links(client):
         "backendapp/services.py", "backendapp/exceptions.py", "backendapp/auth_views.py",
         "backendapp/config.py", "backendapp/filters.py", "backendapp/pagination.py",
         "backendapp/middleware.py", "backendapp/roles.py", "backendapp/signals.py",
+        "backendapp/integrations.py", "backendapp/features.py",
     ):
         assert path in data["artifacts"], path
     assert "sqlite" in data["databases_tested"]
     assert "REQ-001" in data["artifacts"]["backendapp/docs.md"]
+    # Phase 8: every approved functional requirement has a written feature entry
+    features = {f["rid"]: f for f in data["features"]}
+    assert set(features) == {"REQ-001", "REQ-002"}
+    assert all(f["status"] == "implemented" for f in features.values())
+    assert all("services.transition_status" in f["service"] for f in features.values())
+    assert data["feature_summary"]["total"] == 2
+    assert "## Business logic per requirement" in data["artifacts"]["backendapp/docs.md"]
     # trace map is valid JSON keyed by rid
     trace_map = json.loads(data["artifacts"]["backendapp/requirements_map.json"])
     assert {t["rid"] for t in trace_map} == {"REQ-001", "REQ-002"}
@@ -117,6 +125,8 @@ def test_get_generated_backend(client):
     assert res.status_code == 200
     assert res.data["status"] == "success"
     assert "sqlite" in res.data["databases_tested"]
+    assert {f["rid"] for f in res.data["features"]} == {"REQ-001", "REQ-002"}
+    assert res.data["feature_summary"]["implemented"] == 2
 
 
 def test_cannot_generate_for_other_users_project(client, django_user_model):

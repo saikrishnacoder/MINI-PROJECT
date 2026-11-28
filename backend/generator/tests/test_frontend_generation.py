@@ -75,6 +75,7 @@ def test_frontend_generation_builds_real_app_and_trace_links(client):
         "requirements_map.json", "src/queries.ts", "src/preferences.tsx",
         "src/components/Toast.tsx", "src/pages/Landing.tsx",
         "src/pages/Profile.tsx", "src/pages/Settings.tsx",
+        "src/components/Notifications.tsx", "src/pages/Features.tsx",
     ):
         assert path in data["artifacts"], path
     # the generated app uses the query library, icon set, toasts and filters it ships
@@ -83,12 +84,21 @@ def test_frontend_generation_builds_real_app_and_trace_links(client):
     queries = data["artifacts"]["src/queries.ts"]
     assert "useQuery" in queries and "useMutation" in queries
     app = data["artifacts"]["src/App.tsx"]
-    for route in ('path="/dashboard"', 'path="/profile"', 'path="/settings"'):
+    for route in ('path="/dashboard"', 'path="/profile"', 'path="/settings"', 'path="/features"'):
         assert route in app, route
+    notifications = data["artifacts"]["src/components/Notifications.tsx"]
+    assert "useUnreadCount" in notifications and "markAllRead" in notifications
+    features_page = data["artifacts"]["src/pages/Features.tsx"]
+    assert "useFeatureMatrix" in features_page and "configuration_required" in features_page
+    dashboard = data["artifacts"]["src/pages/Dashboard.tsx"]
+    assert "useAnalytics" in dashboard and "created_last_7_days" in dashboard
+    settings = data["artifacts"]["src/pages/Settings.tsx"]
+    assert "useIntegrations" in settings and "not configured" in settings
     toast = data["artifacts"]["src/components/Toast.tsx"]
     assert 'role="status"' in toast and "aria-live" in toast
     listing = data["artifacts"]["src/pages/ResourceListPage.tsx"]
-    for control in ("created_after", "created_before", "ordering", "Clear filters"):
+    for control in ("created_after", "created_before", "ordering", "Clear filters",
+                    "useTransitionItem", "Request payment", "status"):
         assert control in listing, control
     assert "APP_NAME" in data["artifacts"]["src/pages/Landing.tsx"]
     # every generated page is traced to its requirement ID in the docs and registry

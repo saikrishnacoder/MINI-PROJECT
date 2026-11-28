@@ -22,6 +22,11 @@ class GeneratedBackend(models.Model):
     test_output = models.TextField(blank=True)
     # Databases the generated suite was actually executed on, e.g. ["sqlite", "mysql"].
     databases_tested = models.JSONField(default=list, blank=True)
+    # Phase 8: one entry per approved functional requirement - capabilities, service
+    # functions, tables, endpoints, rules, validations and tests, plus its status
+    # ("implemented" or "configuration_required" with a written reason).
+    features = models.JSONField(default=list, blank=True)
+    feature_summary = models.JSONField(default=dict, blank=True)
     generated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
         related_name="generated_backends",

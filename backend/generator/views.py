@@ -50,6 +50,8 @@ class GenerateBackendView(APIView):
                 "tests_passed": result["tests_passed"],
                 "test_output": result["test_output"],
                 "databases_tested": result["databases_tested"],
+                "features": result["features"],
+                "feature_summary": result["feature_summary"],
                 "generated_by": request.user,
             },
         )
